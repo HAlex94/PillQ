@@ -1,5 +1,3 @@
-Below is an example README.md tailored to your PillQ app, explicitly referencing the dependencies you’ve listed and DailyMed usage in your web scraper. Feel free to adapt any wording or sections to match your environment, organizational style, or additional instructions.
-
 PillQ – Pill Queries, Simplified
 
 PillQ is a Streamlit application designed to help you quickly retrieve and display drug label data from various FDA endpoints and DailyMed. It’s intended for formulary management, drug verification, and other clinical documentation tasks. By leveraging multiple sources (including openFDA, the FDA NDC directory, and DailyMed web scraping), PillQ aims to present consolidated medication information with minimal effort.
