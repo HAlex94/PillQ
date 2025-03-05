@@ -338,3 +338,65 @@ with tab1:
                     )
         else:
             st.info("Enter comma-separated items and click 'Preview Data'.")
+
+# ==================== TAB 2: File Upload Mode ====================
+with tab2:
+    st.subheader("File Upload Mode")
+    file_upload = st.file_uploader("Upload CSV (with 'NDC' column)", type=["csv"])
+    if file_upload:
+        df_input = pd.read_csv(file_upload)
+        st.write("### Uploaded Data Preview", df_input.head())
+        if "NDC" not in df_input.columns:
+            st.error("The uploaded CSV must contain an 'NDC' column.")
+        else:
+            # Let user pick data fields
+            openfda_fields_2 = sorted(list(get_openfda_searchable_fields()))
+            if not openfda_fields_2:
+                openfda_fields_2 = ["active_ingredient", "inactive_ingredient", "indications_and_usage"]
+            for needed in ["brand_name", "generic_name"]:
+                if needed not in openfda_fields_2:
+                    openfda_fields_2.append(needed)
+            openfda_fields_2 = sorted(openfda_fields_2)
+            
+            selected_labels_2 = st.multiselect("Data Fields for File Processing", options=openfda_fields_2, default=["brand_name", "generic_name"])
+            include_source_2 = st.checkbox("Include Source Info in Output (File)", value=True)
+            out_fmt = st.radio("Output Format (File)", ["JSON", "CSV", "Excel", "TXT"], horizontal=True)
+            
+            if st.button("Process File"):
+                processed_rows = []
+                for idx, row in df_input.iterrows():
+                    ndc_val = str(row["NDC"]).strip()
+                    row_dict = row.to_dict()
+                    computed = search_ndc(ndc_val, selected_labels_2, include_source=include_source_2)
+                    row_dict.update(computed)
+                    processed_rows.append(row_dict)
+                df_output = pd.DataFrame(processed_rows)
+                
+                input_cols = list(df_input.columns)
+                computed_cols = selected_labels_2[:]
+                if include_source_2:
+                    computed_cols += [c + "_source" for c in selected_labels_2]
+                out_cols = list(dict.fromkeys(input_cols + computed_cols))
+                chosen_cols = st.multiselect("Select Output Columns", out_cols, default=out_cols)
+                df_output = df_output[chosen_cols]
+                
+                st.write("### Processed Output Preview")
+                if out_fmt == "JSON":
+                    st.json(df_output.to_dict(orient="records"))
+                elif out_fmt in ["CSV", "Excel"]:
+                    st.dataframe(df_output)
+                elif out_fmt == "TXT":
+                    st.text(df_output.to_csv(sep="\t", index=False))
+                
+                conv_data = convert_df(df_output, out_fmt)
+                st.download_button(
+                    label="Download Output",
+                    data=conv_data,
+                    file_name=f"pillq_file_output.{out_fmt.lower()}",
+                    mime="text/csv" if out_fmt == "CSV" else
+                         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" if out_fmt == "Excel" else
+                         "text/plain" if out_fmt == "TXT" else
+                         "application/json"
+                )
+    else:
+        st.info("Upload a CSV file to process in batch mode.")
