@@ -978,7 +978,8 @@ with tab3:
             model_name = st.text_input(
                 "Enter HuggingFace Model Name",
                 value=st.session_state.model_name,
-                help="Enter the name of the HuggingFace model you want to use. You can find the list of available models at https://huggingface.co/models"
+                help="Enter the name of the HuggingFace model you want to use. You can find the list of available models at https://huggingface.co/models",
+                key="huggingface_model_name_dropdown"
             )
         
         if model_name != st.session_state.model_name:
@@ -1030,7 +1031,8 @@ with tab3:
         huggingface_model_name = st.text_input(
             "Enter HuggingFace Model Name",
             value=st.session_state.model_name,
-            help="Enter the name of the HuggingFace model you want to use. You can find the list of available models at https://huggingface.co/models"
+            help="Enter the name of the HuggingFace model you want to use. You can find the list of available models at https://huggingface.co/models",
+            key="huggingface_model_name_settings"
         )
         if huggingface_model_name != st.session_state.model_name:
             st.session_state.model_name = huggingface_model_name
