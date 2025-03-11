@@ -1,99 +1,30 @@
 import streamlit as st
+st.set_page_config(page_title="PillQ 💊 – Pill Queries, Simplified", layout="wide")
+
 import pandas as pd
-import requests
 import io
-import urllib
+import requests
 import urllib.parse
+import os
+import base64
+import json
+
 from helper_functions import (
     get_openfda_searchable_fields,
+    get_product_image,
+    get_product_ndc,
     get_label_field,
     get_combined_label_field,
     get_setid_from_search,
     fallback_ndc_search,
     unify_source_string,
-    convert_df,
-    get_product_image,
-    get_product_ndc
+    convert_df
 )
-import json
-import os
-from pathlib import Path
-import time
-import base64
-
-# ------------------------------------------------------------------
-# Setup and Configuration
-# ------------------------------------------------------------------
-
-# Set page config
-st.set_page_config(
-    page_title="PillQ - Pharmaceutical Information Tool",
-    page_icon="💊",
-    layout="wide",
-    initial_sidebar_state="collapsed"
-)
-
-# Settings and session state initialization
-if 'openai_api_key' not in st.session_state:
-    st.session_state.openai_api_key = ""
-if 'ollama_url' not in st.session_state:
-    st.session_state.ollama_url = "http://localhost:11434"
-if 'deepseek_api_key' not in st.session_state:
-    st.session_state.deepseek_api_key = ""
-if 'huggingface_api_key' not in st.session_state:
-    st.session_state.huggingface_api_key = ""
-if 'selected_model' not in st.session_state:
-    st.session_state.selected_model = "HuggingFace"
-if 'model_name' not in st.session_state:
-    st.session_state.model_name = "google/flan-t5-small"
-
-# Load settings from file if it exists
-def load_settings():
-    settings_path = Path("settings.json")
-    if settings_path.exists():
-        try:
-            with open(settings_path, "r") as f:
-                settings = json.load(f)
-                st.session_state.openai_api_key = settings.get("openai_api_key", "")
-                st.session_state.ollama_url = settings.get("ollama_url", "http://localhost:11434")
-                st.session_state.deepseek_api_key = settings.get("deepseek_api_key", "")
-                st.session_state.huggingface_api_key = settings.get("huggingface_api_key", "")
-                st.session_state.selected_model = settings.get("selected_model", "HuggingFace")
-                st.session_state.model_name = settings.get("model_name", "google/flan-t5-small")
-        except Exception as e:
-            print(f"Error loading settings: {e}")
-
-# Save settings to file
-def save_settings():
-    settings_path = Path("settings.json")
-    try:
-        settings = {
-            "openai_api_key": st.session_state.openai_api_key,
-            "ollama_url": st.session_state.ollama_url,
-            "deepseek_api_key": st.session_state.deepseek_api_key,
-            "huggingface_api_key": st.session_state.huggingface_api_key,
-            "selected_model": st.session_state.selected_model,
-            "model_name": st.session_state.model_name
-        }
-        with open(settings_path, "w") as f:
-            json.dump(settings, f)
-    except Exception as e:
-        print(f"Error saving settings: {e}")
-
-# Load settings at startup
-load_settings()
 
 # ------------------------------------------------------------------
 # Title & Description
 # ------------------------------------------------------------------
-st.markdown(
-    """
-    <div style="display: flex; align-items: center;">
-        <h1>PillQ – Pill Queries, Simplified 💊</h1>
-    </div>
-    """, 
-    unsafe_allow_html=True
-)
+st.title("PillQ 💊 – Pill Queries, Simplified")
 st.markdown("""
 Spend less time searching and more time making decisions.  
 **PillQ** deciphers complex drug data in an instant—whether for formulary management, verification, or documentation.  
@@ -104,37 +35,6 @@ Pill Queries, Simplified.
 # 1) Enhanced function to fetch brand/generic name info from the drugsfda endpoint
 #    so we can retrieve dosage_form, route, strength, etc.
 # ------------------------------------------------------------------
-
-# Define this function before it's used in fetch_ndcs_for_name_drugsfda
-def get_package_ndcs_for_product(product_ndc):
-    """
-    Given a product NDC, retrieve all package NDCs associated with it from the NDC directory.
-    Returns a list of package NDCs.
-    """
-    base_url = "https://api.fda.gov/drug/ndc.json"
-    query = f'product_ndc:"{product_ndc}"'
-    params = {"search": query, "limit": 1}
-    
-    try:
-        resp = requests.get(base_url, params=params, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-        
-        if "results" in data and data["results"]:
-            result = data["results"][0]
-            packaging = result.get("packaging", [])
-            package_ndcs = []
-            
-            for pkg in packaging:
-                package_ndc = pkg.get("package_ndc")
-                if package_ndc:
-                    package_ndcs.append(package_ndc)
-            
-            return package_ndcs
-    except Exception as e:
-        print(f"Error retrieving package NDCs: {e}")
-    
-    return []
 
 def fetch_ndcs_for_name_drugsfda(name_str, limit=50):
     """
@@ -171,32 +71,17 @@ def fetch_ndcs_for_name_drugsfda(name_str, limit=50):
                     dform = prod.get("dosage_form", "Not Available")
                     route = prod.get("route", "Not Available")
                     
-                    # Get manufacturer information
-                    manufacturer = item.get("sponsor_name", "Not Available")
-                    
-                    # Get or create product description
-                    prod_type = prod.get("product_type", "")
-                    marketing_status = prod.get("marketing_status", "")
-                    product_description = f"{prod_type} {marketing_status}".strip()
-                    if not product_description:
-                        product_description = "Not Available"
-                    
                     # active_ingredients => parse name + strength
                     ai_list = prod.get("active_ingredients", [])
                     if ai_list:
                         pieces = []
-                        strength_only = []
                         for ai in ai_list:
                             nm = ai.get("name", "")
                             stg = ai.get("strength", "")
                             if nm or stg:
                                 pieces.append(f"{nm} {stg}".strip())
-                                strength_only.append(stg.strip())
-                        active_ingr = " | ".join(pieces) if pieces else "Not Available"
-                        # Extract only the strength part
-                        strength = " | ".join(strength_only) if strength_only else "Not Available"
+                        strength = " | ".join(pieces) if pieces else "Not Available"
                     else:
-                        active_ingr = "Not Available"
                         strength = "Not Available"
                     
                     # If generic_name is "Not Available", use active_ingredients as "gen"
@@ -222,20 +107,18 @@ def fetch_ndcs_for_name_drugsfda(name_str, limit=50):
                             fallback_name = gen if gen != "Not Available" else uppercase_term
                         
                         from urllib.parse import quote
-                        # Use fallback function to get NDCs
+                        # Use your fallback function from the example above
                         fallback_list = fallback_ndc_search(fallback_name)
                         
                         if not fallback_list:
                             # No fallback NDC found
                             results_list.append({
-                                "NDC": "Not Available",
                                 "Brand Name": brand,
                                 "Generic Name": gen,
-                                "Strength": strength,
-                                "Route": route,
+                                "NDC": "Not Available",
                                 "Dosage Form": dform,
-                                "Manufacturer": manufacturer,
-                                "Product Description": product_description
+                                "Route": route,
+                                "Strength": strength
                             })
                         else:
                             # For each fallback code, get package NDCs
@@ -247,26 +130,22 @@ def fetch_ndcs_for_name_drugsfda(name_str, limit=50):
                                     # Add each package NDC as a separate row
                                     for package_ndc in package_ndcs:
                                         results_list.append({
-                                            "NDC": package_ndc,
                                             "Brand Name": brand,
                                             "Generic Name": gen,
-                                            "Strength": strength,
-                                            "Route": route,
+                                            "NDC": package_ndc,
                                             "Dosage Form": dform,
-                                            "Manufacturer": manufacturer,
-                                            "Product Description": product_description
+                                            "Route": route,
+                                            "Strength": strength
                                         })
                                 else:
                                     # If no package NDCs found, use the product NDC
                                     results_list.append({
-                                        "NDC": ndc_val,
                                         "Brand Name": brand,
                                         "Generic Name": gen,
-                                        "Strength": strength,
-                                        "Route": route,
+                                        "NDC": ndc_val,
                                         "Dosage Form": dform,
-                                        "Manufacturer": manufacturer,
-                                        "Product Description": product_description
+                                        "Route": route,
+                                        "Strength": strength
                                     })
                     else:
                         # If openfda product_ndc is found, get package NDCs for each product
@@ -278,26 +157,22 @@ def fetch_ndcs_for_name_drugsfda(name_str, limit=50):
                                 # Add each package NDC as a separate row
                                 for package_ndc in package_ndcs:
                                     results_list.append({
-                                        "NDC": package_ndc,
                                         "Brand Name": brand,
                                         "Generic Name": gen,
-                                        "Strength": strength,
-                                        "Route": route,
+                                        "NDC": package_ndc,
                                         "Dosage Form": dform,
-                                        "Manufacturer": manufacturer,
-                                        "Product Description": product_description
+                                        "Route": route,
+                                        "Strength": strength
                                     })
                             else:
                                 # If no package NDCs found, use the product NDC
                                 results_list.append({
-                                    "NDC": ndc_val,
                                     "Brand Name": brand,
                                     "Generic Name": gen,
-                                    "Strength": strength,
-                                    "Route": route,
+                                    "NDC": ndc_val,
                                     "Dosage Form": dform,
-                                    "Manufacturer": manufacturer,
-                                    "Product Description": product_description
+                                    "Route": route,
+                                    "Strength": strength
                                 })
     except Exception as e:
         st.error(f"Error retrieving data from openFDA drugsfda endpoint: {e}")
@@ -306,6 +181,36 @@ def fetch_ndcs_for_name_drugsfda(name_str, limit=50):
     if results_list:
         results_list = sorted(results_list, key=lambda x: x["Brand Name"])
     return results_list
+
+def get_package_ndcs_for_product(product_ndc):
+    """
+    Given a product NDC, retrieve all package NDCs associated with it from the NDC directory.
+    Returns a list of package NDCs.
+    """
+    base_url = "https://api.fda.gov/drug/ndc.json"
+    query = f'product_ndc:"{product_ndc}"'
+    params = {"search": query, "limit": 1}
+    
+    try:
+        resp = requests.get(base_url, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        
+        if "results" in data and data["results"]:
+            result = data["results"][0]
+            packaging = result.get("packaging", [])
+            package_ndcs = []
+            
+            for pkg in packaging:
+                package_ndc = pkg.get("package_ndc")
+                if package_ndc:
+                    package_ndcs.append(package_ndc)
+            
+            return package_ndcs
+    except Exception as e:
+        print(f"Error retrieving package NDCs: {e}")
+    
+    return []
 
 # ------------------------------------------------------------------
 # 2) Searching by NDC with your existing logic (ensures source is set properly)
@@ -373,9 +278,118 @@ def get_single_item_source(data_dict, labels, include_source):
         return "openFDA + DailyMed"
 
 # ------------------------------------------------------------------
-# Layout with three tabs: Single/Multiple Search, File Upload, Settings
+# Layout with three tabs
 # ------------------------------------------------------------------
 tab1, tab2, tab3 = st.tabs(["Single/Multiple Search", "File Upload", "Settings"])
+
+# Initialize session state for AI assistant and settings
+if 'ai_response' not in st.session_state:
+    st.session_state.ai_response = ""
+if 'chat_history' not in st.session_state:
+    st.session_state.chat_history = []
+if 'api_key' not in st.session_state:
+    st.session_state.api_key = ""
+if 'provider' not in st.session_state:
+    st.session_state.provider = "HuggingFace"  # Default to free option
+if 'model_name' not in st.session_state:
+    st.session_state.model_name = "google/flan-t5-small"  # Default to a free model
+
+def get_ai_response(prompt, provider, api_key=None, model_name=None):
+    """Get response from the selected AI model."""
+    try:
+        # Add the prompt to the history
+        history = st.session_state.chat_history
+        history.append({"role": "user", "content": prompt})
+        
+        if provider == "OpenAI":
+            # OpenAI API
+            import openai
+            openai.api_key = api_key
+            
+            messages = []
+            for message in history:
+                messages.append({"role": message["role"], "content": message["content"]})
+            
+            response = openai.ChatCompletion.create(
+                model=model_name,
+                messages=messages
+            )
+            answer = response.choices[0].message.content
+        
+        elif provider == "Ollama":
+            # Ollama API
+            ollama_url = "http://localhost:11434/api/chat"
+            
+            headers = {"Content-Type": "application/json"}
+            messages = []
+            for message in history:
+                messages.append({"role": message["role"], "content": message["content"]})
+            
+            data = {
+                "model": model_name,
+                "messages": messages
+            }
+            
+            response = requests.post(ollama_url, headers=headers, json=data, timeout=60)
+            response.raise_for_status()
+            answer = response.json()['message']['content']
+        
+        elif provider == "DeepSeek":
+            # DeepSeek API
+            deepseek_url = "https://api.deepseek.com/v1/chat/completions"
+            
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}"
+            }
+            
+            messages = []
+            for message in history:
+                messages.append({"role": message["role"], "content": message["content"]})
+            
+            data = {
+                "model": model_name,
+                "messages": messages
+            }
+            
+            response = requests.post(deepseek_url, headers=headers, json=data, timeout=60)
+            response.raise_for_status()
+            answer = response.json()['choices'][0]['message']['content']
+        
+        elif provider == "HuggingFace":
+            # Use HuggingFace Transformers (no API key required for many models)
+            try:
+                from transformers import pipeline
+                
+                # Initialize the pipeline with the specified model
+                generator = pipeline("text-generation", model=model_name)
+                
+                # Combine history into a single string for context
+                context = ""
+                for message in history:
+                    prefix = "User: " if message["role"] == "user" else "Assistant: "
+                    context += prefix + message["content"] + "\n"
+                
+                # Generate response
+                response = generator(context + "Assistant: ", max_length=200, do_sample=True)
+                
+                # Extract answer from the generated text
+                full_response = response[0]['generated_text']
+                answer = full_response.split("Assistant: ")[-1].strip()
+                
+            except Exception as e:
+                answer = f"Error using HuggingFace model: {str(e)}"
+        
+        else:
+            answer = "Selected AI provider not implemented."
+        
+        # Add the answer to history
+        history.append({"role": "assistant", "content": answer})
+        
+        return answer
+    
+    except Exception as e:
+        return f"Error: {str(e)}"
 
 with tab1:
     col_left, col_right = st.columns([1, 2])
@@ -477,154 +491,65 @@ with tab1:
                             st.markdown("### Search Results")
                             
                             # Create DataFrame from search results
-                            df_display = pd.DataFrame(name_results)
+                            df = pd.DataFrame(name_results)
                             
-                            # Calculate dynamic height based on number of rows, capped at ~8 rows
-                            num_rows = len(df_display)
-                            # Base height per row (~40px) + header (~45px) + some padding
-                            dynamic_height = min(max(num_rows * 40 + 45, 100), 375)  # Min height 100px, max ~8 rows (375px)
-                            
-                            # Display the table with static data
-                            st.dataframe(df_display, height=dynamic_height, use_container_width=True)
-
-                            # Add an export button for the complete table
-                            st.markdown("### Export Search Results Table")
-                            export_table = df_display.copy()
-                            
-                            # Add option to include search field data in export
-                            include_field_data = st.checkbox("Include data from selected search fields", value=True, key="include_fields_export")
-                            
-                            # If user wants to include field data, fetch and add it to the export table
-                            if include_field_data and labels_to_get:
-                                # Create a progress bar for field data fetching
-                                fetch_progress = st.progress(0)
-                                st.write("Fetching field data for each NDC...")
-                                
-                                # Create columns for each selected field
-                                for field in labels_to_get:
-                                    export_table[field] = None
-                                
-                                # Fetch detailed data for each NDC and add the fields
-                                for i, row in export_table.iterrows():
-                                    ndc = row['NDC']
-                                    # Update progress bar
-                                    fetch_progress.progress((i + 1) / len(export_table))
-                                    
-                                    try:
-                                        # Get detailed data for this NDC
-                                        detailed_data = search_ndc(ndc, labels_to_get, include_source=False)
-                                        
-                                        # Add each selected field to the export table
-                                        for field in labels_to_get:
-                                            if field in detailed_data:
-                                                export_table.at[i, field] = detailed_data[field]
-                                    except Exception as e:
-                                        st.warning(f"Could not fetch detailed data for NDC {ndc}: {e}")
-                                
-                                # Complete the progress
-                                fetch_progress.progress(1.0)
-                                st.success("Field data fetched successfully!")
-                            
-                            # If user selects export, provide download in selected format
-                            if st.button("Export Table Results"):
-                                if export_format == "CSV":
-                                    csv = convert_df(export_table, "CSV")
-                                    st.download_button(
-                                        label="Download CSV",
-                                        data=csv,
-                                        file_name="search_results.csv",
-                                        mime="text/csv"
-                                    )
-                                elif export_format == "Excel":
-                                    excel = convert_df(export_table, "Excel")
-                                    st.download_button(
-                                        label="Download Excel",
-                                        data=excel,
-                                        file_name="search_results.xlsx",
-                                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                                    )
-                                elif export_format == "TXT":
-                                    txt = convert_df(export_table, "TXT")
-                                    st.download_button(
-                                        label="Download TXT",
-                                        data=txt,
-                                        file_name="search_results.txt",
-                                        mime="text/plain"
-                                    )
-                                else:  # JSON
-                                    json_str = convert_df(export_table, "JSON")
-                                    st.download_button(
-                                        label="Download JSON",
-                                        data=json_str,
-                                        file_name="search_results.json",
-                                        mime="application/json"
-                                    )
-                            
-                            # Create a list of NDC options for the multiselect
-                            ndc_options = [ndc_item['NDC'] for ndc_item in name_results]
-                            
-                            # Create a multiselect for the NDCs - use empty list when options change
-                            st.markdown("### Select NDC(s) to preview")
-                            
-                            # Only use existing selections if they're still valid options
-                            valid_defaults = [ndc for ndc in st.session_state.selected_ndcs if ndc in ndc_options]
-                            
-                            selected_ndcs = st.multiselect(
-                                "Choose one or more NDCs to view details",
-                                options=ndc_options,
-                                default=valid_defaults,
-                                key="ndc_multiselect"
+                            # Use Streamlit's data_editor to display the table
+                            edited_df = st.data_editor(
+                                df,
+                                column_config={
+                                    "Brand Name": st.column_config.TextColumn("Brand Name"),
+                                    "Generic Name": st.column_config.TextColumn("Generic Name"),
+                                    "NDC": st.column_config.TextColumn("NDC"),
+                                    "Dosage Form": st.column_config.TextColumn("Dosage Form"),
+                                    "Route": st.column_config.TextColumn("Route"),
+                                    "Strength": st.column_config.TextColumn("Strength"),
+                                },
+                                hide_index=True,
+                                use_container_width=True,
+                                key="data_editor_name_results"
                             )
                             
-                            # Update the session state
-                            st.session_state.selected_ndcs = selected_ndcs
-                            
-                            # Display detailed information for selected NDCs
-                            if selected_ndcs:
-                                st.markdown("### Detailed Information for Selected NDC(s)")
+                            # Multiselect for exporting specific rows
+                            if not edited_df.empty:
+                                st.markdown("### Export Options")
                                 
-                                # Create tabs for each selected NDC
-                                ndc_tabs = st.tabs(selected_ndcs)
+                                export_format = st.radio("Export Format", ["CSV", "Excel", "JSON"], horizontal=True)
                                 
-                                # For each tab, display the detailed information for that NDC
-                                for i, ndc in enumerate(selected_ndcs):
-                                    with ndc_tabs[i]:
-                                        # Get all fields for the NDC
-                                        detailed_data = search_ndc(ndc, labels_to_get, include_sources)
-                                        
-                                        # Display the data in the selected format
-                                        if export_format == "JSON":
-                                            st.json(detailed_data)
-                                        elif export_format == "CSV":
-                                            df_detailed = pd.DataFrame([detailed_data])
-                                            st.dataframe(df_detailed)
-                                            csv = convert_df(df_detailed, "CSV")
-                                            st.download_button(
-                                                label="Download CSV",
-                                                data=csv,
-                                                file_name=f"{ndc}_details.csv",
-                                                mime="text/csv"
-                                            )
-                                        elif export_format == "Excel":
-                                            df_detailed = pd.DataFrame([detailed_data])
-                                            st.dataframe(df_detailed)
-                                            excel = convert_df(df_detailed, "Excel")
-                                            st.download_button(
-                                                label="Download Excel",
-                                                data=excel,
-                                                file_name=f"{ndc}_details.xlsx",
-                                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                                            )
-                                        elif export_format == "TXT":
-                                            df_detailed = pd.DataFrame([detailed_data])
-                                            st.dataframe(df_detailed)
-                                            txt = convert_df(df_detailed, "TXT")
-                                            st.download_button(
-                                                label="Download TXT",
-                                                data=txt,
-                                                file_name=f"{ndc}_details.txt",
-                                                mime="text/plain"
-                                            )
+                                # Allow selection of specific NDCs for export
+                                selected_ndcs = st.multiselect(
+                                    "Select NDCs for Detailed Export",
+                                    options=edited_df["NDC"].tolist(),
+                                    help="Select one or more NDCs to view detailed information"
+                                )
+                                
+                                # Export button for the entire table
+                                export_table = edited_df
+                                
+                                if st.button("Export Table Results"):
+                                    if export_format == "CSV":
+                                        csv = convert_df(export_table, "CSV")
+                                        st.download_button(
+                                            label="Download CSV",
+                                            data=csv,
+                                            file_name=f"{item}_results.csv",
+                                            mime="text/csv"
+                                        )
+                                    elif export_format == "Excel":
+                                        excel = convert_df(export_table, "Excel")
+                                        st.download_button(
+                                            label="Download Excel",
+                                            data=excel,
+                                            file_name=f"{item}_results.xlsx",
+                                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                                        )
+                                    else:  # JSON
+                                        json_data = convert_df(export_table, "JSON")
+                                        st.download_button(
+                                            label="Download JSON",
+                                            data=json_data,
+                                            file_name=f"{item}_results.json",
+                                            mime="application/json"
+                                        )
             
             # Export all combined results if not name search
             if all_results and len(all_results) == len(items) and all(isinstance(item, dict) for item in all_results):
@@ -676,183 +601,35 @@ with tab1:
                                 mime="text/plain"
                             )
 
-def get_package_ndcs_for_product(product_ndc):
-    """
-    Given a product NDC, retrieve all package NDCs associated with it from the NDC directory.
-    Returns a list of package NDCs.
-    """
-    base_url = "https://api.fda.gov/drug/ndc.json"
-    query = f'product_ndc:"{product_ndc}"'
-    params = {"search": query, "limit": 1}
-    
-    try:
-        resp = requests.get(base_url, params=params, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
+    # AI Assistant Section - Only show when requested
+    st.markdown("---")
+    show_assistant = st.checkbox("Show AI Assistant", value=False, key="show_assistant")
+    if show_assistant:
+        st.subheader("AI Assistant")
+        st.markdown(f"Using **{st.session_state.provider}** with model **{st.session_state.model_name}**")
+        st.markdown("Ask me questions about drugs, NDCs, or how to use this app.")
         
-        if "results" in data and data["results"]:
-            result = data["results"][0]
-            packaging = result.get("packaging", [])
-            package_ndcs = []
-            
-            for pkg in packaging:
-                package_ndc = pkg.get("package_ndc")
-                if package_ndc:
-                    package_ndcs.append(package_ndc)
-            
-            return package_ndcs
-    except Exception as e:
-        print(f"Error retrieving package NDCs: {e}")
-    
-    return []
-
-# AI Assistant Section - Only show when requested
-st.markdown("---")
-show_assistant = st.checkbox("Show AI Assistant", value=False, key="show_assistant")
-if show_assistant:
-    # Integrate AI chatbot here
-    st.markdown("### PillQ AI Assistant")
-    st.markdown("Ask me anything about drug information and I'll help you find answers.")
-    
-    # Initialize chat history if it doesn't exist
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = []
-    
-    # Display chat history
-    for i, message in enumerate(st.session_state.chat_history):
-        if message["role"] == "user":
-            st.write(f"**You:** {message['content']}")
-        else:
-            st.write(f"**AI:** {message['content']}")
-    
-    user_question = st.text_area("Your question:", key="ai_question", height=100)
-    
-    if st.button("Ask AI Assistant"):
-        if user_question:
-            # Display the user message
-            st.write(f"**You:** {user_question}")
-            st.session_state.chat_history.append({"role": "user", "content": user_question})
-            
-            # Call the AI assistant with the question
-            with st.spinner("Thinking..."):
-                response = call_ai_assistant(user_question)
-                
-            # Display the AI response
-            st.write(f"**AI:** {response}")
-            st.session_state.chat_history.append({"role": "assistant", "content": response})
-            
-            # Clear the question input
-            st.session_state.ai_question = ""
-        else:
-            st.warning("Please enter a question first.")
-
-# Function to call AI assistant
-def call_ai_assistant(question, context=""):
-    """
-    Call the selected AI model with the question and return the response.
-    Supports OpenAI, Ollama, and DeepSeek.
-    """
-    provider = st.session_state.selected_model
-    
-    if provider == "OpenAI":
-        if not st.session_state.openai_api_key:
-            return "Error: OpenAI API key is not configured. Please set it up in the Settings tab."
+        # Display chat history
+        for message in st.session_state.chat_history:
+            if message["role"] == "user":
+                st.markdown(f"**You:** {message['content']}")
+            else:
+                st.markdown(f"**Assistant:** {message['content']}")
         
-        try:
-            import openai
-            openai.api_key = st.session_state.openai_api_key
-            
-            prompt = f"You are an AI assistant for a pharmaceutical information tool called PillQ. Answer the following question about drugs or pharmaceuticals:\n\n{question}"
-            if context:
-                prompt += f"\n\nContext information: {context}"
-            
-            response = openai.chat.completions.create(
-                model=st.session_state.model_name,
-                messages=[
-                    {"role": "system", "content": "You are a helpful pharmaceutical assistant."},
-                    {"role": "user", "content": prompt}
-                ],
-                max_tokens=1000
-            )
-            return response.choices[0].message.content
-        except Exception as e:
-            return f"Error calling OpenAI API: {str(e)}"
-    
-    elif provider == "Ollama":
-        if not st.session_state.ollama_url:
-            return "Error: Ollama URL is not configured. Please set it up in the Settings tab."
+        # Input for user question
+        user_question = st.text_area("Your question:", key="user_question")
         
-        try:
-            url = f"{st.session_state.ollama_url}/api/chat"
-            
-            prompt = f"You are an AI assistant for a pharmaceutical information tool called PillQ. Answer the following question about drugs or pharmaceuticals:\n\n{question}"
-            if context:
-                prompt += f"\n\nContext information: {context}"
-            
-            payload = {
-                "model": st.session_state.model_name,
-                "messages": [
-                    {"role": "system", "content": "You are a helpful pharmaceutical assistant."},
-                    {"role": "user", "content": prompt}
-                ],
-                "stream": False
-            }
-            
-            response = requests.post(url, json=payload)
-            response.raise_for_status()
-            return response.json()["message"]["content"]
-        except Exception as e:
-            return f"Error calling Ollama API: {str(e)}"
-    
-    elif provider == "DeepSeek":
-        if not st.session_state.deepseek_api_key:
-            return "Error: DeepSeek API key is not configured. Please set it up in the Settings tab."
-        
-        try:
-            url = "https://api.deepseek.com/v1/chat/completions"
-            
-            prompt = f"You are an AI assistant for a pharmaceutical information tool called PillQ. Answer the following question about drugs or pharmaceuticals:\n\n{question}"
-            if context:
-                prompt += f"\n\nContext information: {context}"
-            
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {st.session_state.deepseek_api_key}"
-            }
-            
-            payload = {
-                "model": st.session_state.model_name,
-                "messages": [
-                    {"role": "system", "content": "You are a helpful pharmaceutical assistant."},
-                    {"role": "user", "content": prompt}
-                ]
-            }
-            
-            response = requests.post(url, headers=headers, json=payload)
-            response.raise_for_status()
-            return response.json()["choices"][0]["message"]["content"]
-        except Exception as e:
-            return f"Error calling DeepSeek API: {str(e)}"
-    
-    elif provider == "HuggingFace":
-        try:
-            import torch
-            from transformers import pipeline
-            
-            model_name = st.session_state.model_name
-            model = pipeline("text-generation", model=model_name)
-            
-            prompt = f"You are an AI assistant for a pharmaceutical information tool called PillQ. Answer the following question about drugs or pharmaceuticals:\n\n{question}"
-            if context:
-                prompt += f"\n\nContext information: {context}"
-            
-            response = model(prompt, max_length=1000)
-            return response[0]["generated_text"]
-        except Exception as e:
-            return f"Error calling HuggingFace API: {str(e)}"
-    
-    else:
-        return "Error: Unknown AI provider selected."
+        # Process button
+        if st.button("Ask"):
+            if user_question:
+                # Placeholder for AI response
+                with st.spinner("Thinking..."):
+                    ai_response = get_ai_response(user_question, st.session_state.provider, st.session_state.api_key, st.session_state.model_name)
+                    st.session_state.ai_response = ai_response
+                    st.markdown(f"**Answer:** {ai_response}")
+                    st.experimental_rerun()  # Refresh to show the new message in chat history
+            else:
+                st.warning("Please enter a question first.")
 
 with tab2:
     st.subheader("File Upload")
@@ -930,18 +707,19 @@ with tab2:
                                 
                                 # Get data for this NDC
                                 try:
-                                    ndc_data = search_ndc(ndc_str, openfda_fields, include_sources_upload)
+                                    # Get detailed data for this NDC
+                                    detailed_data = search_ndc(ndc_str, openfda_fields, include_sources_upload)
                                     
-                                    # Add each field as a new column
+                                    # Add each selected field to the output dataframe
                                     for field in openfda_fields:
                                         field_col_name = f"{col}_{field}"
-                                        output_df.at[i, field_col_name] = ndc_data.get(field, "Not Available")
+                                        output_df.at[i, field_col_name] = detailed_data.get(field, "Not Available")
                                         
-                                        if include_sources_upload and field + "_source" in ndc_data:
+                                        if include_sources_upload and field + "_source" in detailed_data:
                                             source_col_name = f"{col}_{field}_source"
-                                            output_df.at[i, source_col_name] = ndc_data[field + "_source"]
+                                            output_df.at[i, source_col_name] = detailed_data[field + "_source"]
                                 except Exception as e:
-                                    st.warning(f"Error processing NDC {ndc_str}: {e}")
+                                    st.warning(f"Could not fetch detailed data for NDC {ndc_str}: {e}")
                         
                         # Display the output
                         st.success("Processing complete!")
@@ -967,95 +745,74 @@ with tab2:
 
 with tab3:
     st.subheader("AI Assistant Settings")
-    st.markdown("Configure your AI assistant to use different providers. API keys and settings are stored locally on your machine.")
     
-    # AI Provider selection
-    st.subheader("AI Provider")
-    provider_col1, provider_col2 = st.columns([1, 2])
+    # Provider selection
+    st.markdown("##### Select AI Provider")
+    provider_options = ["HuggingFace", "OpenAI", "Ollama", "DeepSeek"]
+    selected_provider = st.selectbox(
+        "Choose AI Provider",
+        options=provider_options,
+        index=provider_options.index(st.session_state.provider) if st.session_state.provider in provider_options else 0
+    )
     
-    with provider_col1:
-        provider_options = ["OpenAI", "Ollama", "DeepSeek", "HuggingFace"]
-        selected_provider = st.selectbox(
-            "Select AI Provider",
-            options=provider_options,
-            index=provider_options.index(st.session_state.selected_model)
-        )
-        
-        if selected_provider != st.session_state.selected_model:
-            st.session_state.selected_model = selected_provider
+    # Update provider in session state if changed
+    if selected_provider != st.session_state.provider:
+        st.session_state.provider = selected_provider
     
-    with provider_col2:
-        # Different model options based on selected provider
-        if selected_provider == "OpenAI":
-            model_options = ["gpt-3.5-turbo", "gpt-4", "gpt-4-turbo"]
-            model_name = st.selectbox(
-                "Select Model",
-                options=model_options,
-                index=model_options.index(st.session_state.model_name) if st.session_state.model_name in model_options else 0
-            )
-        elif selected_provider == "Ollama":
-            model_options = ["llama2", "mistral", "mixtral", "gemma", "phi"]
-            model_name = st.selectbox(
-                "Select Model",
-                options=model_options,
-                index=0
-            )
-        elif selected_provider == "DeepSeek":
-            model_options = ["deepseek-chat", "deepseek-coder"]
-            model_name = st.selectbox(
-                "Select Model",
-                options=model_options,
-                index=0
-            )
-        elif selected_provider == "HuggingFace":
-            model_name = st.text_input(
-                "Enter HuggingFace Model Name",
-                value=st.session_state.model_name,
-                help="Enter the name of the HuggingFace model you want to use. You can find the list of available models at https://huggingface.co/models",
-                key="huggingface_model_name_dropdown"
-            )
-        
-        if model_name != st.session_state.model_name:
-            st.session_state.model_name = model_name
-    
-    # API Key configuration
-    st.subheader("API Configuration")
+    # Display provider-specific settings
+    st.markdown("---")
     
     # OpenAI configuration
     if selected_provider == "OpenAI":
         st.markdown("##### OpenAI API Key")
-        openai_key = st.text_input(
-            "Enter your OpenAI API Key",
-            value=st.session_state.openai_api_key,
-            type="password",
-            help="Your OpenAI API key. Get one at https://platform.openai.com/api-keys"
+        api_key = st.text_input("Enter OpenAI API Key", value=st.session_state.api_key, type="password")
+        if api_key != st.session_state.api_key:
+            st.session_state.api_key = api_key
+        
+        # Model selection
+        st.markdown("##### Model Selection")
+        model_options = ["gpt-3.5-turbo", "gpt-4", "gpt-4-turbo"]
+        model_name = st.selectbox(
+            "Choose OpenAI Model",
+            options=model_options,
+            index=model_options.index(st.session_state.model_name) if st.session_state.model_name in model_options else 0
         )
-        if openai_key != st.session_state.openai_api_key:
-            st.session_state.openai_api_key = openai_key
+        
+        if model_name != st.session_state.model_name:
+            st.session_state.model_name = model_name
     
     # Ollama configuration
     elif selected_provider == "Ollama":
-        st.markdown("##### Ollama URL")
-        st.markdown("Ollama runs locally on your machine. Make sure you have it installed and running.")
-        ollama_url = st.text_input(
-            "Ollama URL",
-            value=st.session_state.ollama_url,
-            help="The URL of your Ollama instance. Default is http://localhost:11434"
+        st.markdown("##### Ollama Model")
+        st.markdown("Ollama runs locally on your machine. Make sure the Ollama server is running.")
+        model_options = ["llama2", "mistral", "codellama", "vicuna", "orca-mini"]
+        model_name = st.selectbox(
+            "Choose Ollama Model",
+            options=model_options,
+            index=model_options.index(st.session_state.model_name) if st.session_state.model_name in model_options else 0
         )
-        if ollama_url != st.session_state.ollama_url:
-            st.session_state.ollama_url = ollama_url
+        
+        if model_name != st.session_state.model_name:
+            st.session_state.model_name = model_name
     
     # DeepSeek configuration
     elif selected_provider == "DeepSeek":
         st.markdown("##### DeepSeek API Key")
-        deepseek_key = st.text_input(
-            "Enter your DeepSeek API Key",
-            value=st.session_state.deepseek_api_key,
-            type="password",
-            help="Your DeepSeek API key. Get one at https://platform.deepseek.com/"
+        api_key = st.text_input("Enter DeepSeek API Key", value=st.session_state.api_key, type="password")
+        if api_key != st.session_state.api_key:
+            st.session_state.api_key = api_key
+        
+        # Model selection
+        st.markdown("##### Model Selection")
+        model_options = ["deepseek-chat", "deepseek-coder"]
+        model_name = st.selectbox(
+            "Choose DeepSeek Model",
+            options=model_options,
+            index=model_options.index(st.session_state.model_name) if st.session_state.model_name in model_options else 0
         )
-        if deepseek_key != st.session_state.deepseek_api_key:
-            st.session_state.deepseek_api_key = deepseek_key
+        
+        if model_name != st.session_state.model_name:
+            st.session_state.model_name = model_name
     
     # HuggingFace configuration
     elif selected_provider == "HuggingFace":
@@ -1069,20 +826,44 @@ with tab3:
         )
         if huggingface_model_name != st.session_state.model_name:
             st.session_state.model_name = huggingface_model_name
-    
-    # Save settings button
-    if st.button("Save Settings"):
-        save_settings()
-        st.success("Settings saved successfully!")
+        
+        st.markdown("##### Free Model Suggestions")
+        st.markdown("These models don't require an API key and can run with minimal resources:")
+        free_models = [
+            "google/flan-t5-small",
+            "facebook/bart-large-cnn", 
+            "google/t5-small",
+            "distilbert/distilbert-base-uncased"
+        ]
+        for model in free_models:
+            if st.button(model, key=f"model_button_{model}"):
+                st.session_state.model_name = model
+                st.experimental_rerun()
     
     # Test connection button
+    st.markdown("---")
     if st.button("Test Connection"):
-        with st.spinner("Testing connection..."):
-            test_result = call_ai_assistant("This is a test message to check the connection.")
-            if "Error" in test_result:
-                st.error(test_result)
-            else:
+        try:
+            with st.spinner("Testing connection..."):
+                # Test prompt
+                test_prompt = "Hello, this is a test message. Please respond with 'Connection successful!'"
+                
+                # Get response
+                test_response = get_ai_response(
+                    test_prompt, 
+                    st.session_state.provider, 
+                    st.session_state.api_key, 
+                    st.session_state.model_name
+                )
+                
                 st.success("Connection successful! Your AI assistant is ready to use.")
+        except Exception as e:
+            st.error(f"Connection failed: {e}")
+            
+    # Reset chat history
+    if st.button("Clear Chat History"):
+        st.session_state.chat_history = []
+        st.success("Chat history cleared!")
 
 # Add the artistic pills illustration to the bottom left
 try:
@@ -1111,4 +892,4 @@ try:
             unsafe_allow_html=True
         )
 except Exception as e:
-    st.write(f"Note: Illustration couldn't be loaded. This doesn't affect app functionality.")
+    pass  # Silently ignore if illustration can't be loaded
