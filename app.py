@@ -17,6 +17,7 @@ import json
 import os
 from pathlib import Path
 import time
+import base64
 
 # ------------------------------------------------------------------
 # Setup and Configuration
@@ -37,10 +38,12 @@ if 'ollama_url' not in st.session_state:
     st.session_state.ollama_url = "http://localhost:11434"
 if 'deepseek_api_key' not in st.session_state:
     st.session_state.deepseek_api_key = ""
+if 'huggingface_api_key' not in st.session_state:
+    st.session_state.huggingface_api_key = ""
 if 'selected_model' not in st.session_state:
-    st.session_state.selected_model = "OpenAI"
+    st.session_state.selected_model = "HuggingFace"
 if 'model_name' not in st.session_state:
-    st.session_state.model_name = "gpt-3.5-turbo"
+    st.session_state.model_name = "google/flan-t5-small"
 
 # Load settings from file if it exists
 def load_settings():
@@ -52,8 +55,9 @@ def load_settings():
                 st.session_state.openai_api_key = settings.get("openai_api_key", "")
                 st.session_state.ollama_url = settings.get("ollama_url", "http://localhost:11434")
                 st.session_state.deepseek_api_key = settings.get("deepseek_api_key", "")
-                st.session_state.selected_model = settings.get("selected_model", "OpenAI")
-                st.session_state.model_name = settings.get("model_name", "gpt-3.5-turbo")
+                st.session_state.huggingface_api_key = settings.get("huggingface_api_key", "")
+                st.session_state.selected_model = settings.get("selected_model", "HuggingFace")
+                st.session_state.model_name = settings.get("model_name", "google/flan-t5-small")
         except Exception as e:
             print(f"Error loading settings: {e}")
 
@@ -65,6 +69,7 @@ def save_settings():
             "openai_api_key": st.session_state.openai_api_key,
             "ollama_url": st.session_state.ollama_url,
             "deepseek_api_key": st.session_state.deepseek_api_key,
+            "huggingface_api_key": st.session_state.huggingface_api_key,
             "selected_model": st.session_state.selected_model,
             "model_name": st.session_state.model_name
         }
@@ -79,7 +84,14 @@ load_settings()
 # ------------------------------------------------------------------
 # Title & Description
 # ------------------------------------------------------------------
-st.title("PillQ – Pill Queries, Simplified")
+st.markdown(
+    """
+    <div style="display: flex; align-items: center;">
+        <h1>PillQ – Pill Queries, Simplified 💊</h1>
+    </div>
+    """, 
+    unsafe_allow_html=True
+)
 st.markdown("""
 Spend less time searching and more time making decisions.  
 **PillQ** deciphers complex drug data in an instant—whether for formulary management, verification, or documentation.  
@@ -789,6 +801,23 @@ def call_ai_assistant(question, context=""):
         except Exception as e:
             return f"Error calling DeepSeek API: {str(e)}"
     
+    elif provider == "HuggingFace":
+        try:
+            import torch
+            from transformers import pipeline
+            
+            model_name = st.session_state.model_name
+            model = pipeline("text-generation", model=model_name)
+            
+            prompt = f"You are an AI assistant for a pharmaceutical information tool called PillQ. Answer the following question about drugs or pharmaceuticals:\n\n{question}"
+            if context:
+                prompt += f"\n\nContext information: {context}"
+            
+            response = model(prompt, max_length=1000)
+            return response[0]["generated_text"]
+        except Exception as e:
+            return f"Error calling HuggingFace API: {str(e)}"
+    
     else:
         return "Error: Unknown AI provider selected."
 
@@ -912,7 +941,7 @@ with tab3:
     provider_col1, provider_col2 = st.columns([1, 2])
     
     with provider_col1:
-        provider_options = ["OpenAI", "Ollama", "DeepSeek"]
+        provider_options = ["OpenAI", "Ollama", "DeepSeek", "HuggingFace"]
         selected_provider = st.selectbox(
             "Select AI Provider",
             options=provider_options,
@@ -944,6 +973,12 @@ with tab3:
                 "Select Model",
                 options=model_options,
                 index=0
+            )
+        elif selected_provider == "HuggingFace":
+            model_name = st.text_input(
+                "Enter HuggingFace Model Name",
+                value=st.session_state.model_name,
+                help="Enter the name of the HuggingFace model you want to use. You can find the list of available models at https://huggingface.co/models"
             )
         
         if model_name != st.session_state.model_name:
@@ -988,6 +1023,18 @@ with tab3:
         if deepseek_key != st.session_state.deepseek_api_key:
             st.session_state.deepseek_api_key = deepseek_key
     
+    # HuggingFace configuration
+    elif selected_provider == "HuggingFace":
+        st.markdown("##### HuggingFace Model Name")
+        st.markdown("Enter the name of the HuggingFace model you want to use. You can find the list of available models at https://huggingface.co/models")
+        huggingface_model_name = st.text_input(
+            "Enter HuggingFace Model Name",
+            value=st.session_state.model_name,
+            help="Enter the name of the HuggingFace model you want to use. You can find the list of available models at https://huggingface.co/models"
+        )
+        if huggingface_model_name != st.session_state.model_name:
+            st.session_state.model_name = huggingface_model_name
+    
     # Save settings button
     if st.button("Save Settings"):
         save_settings()
@@ -1001,3 +1048,25 @@ with tab3:
                 st.error(test_result)
             else:
                 st.success("Connection successful! Your AI assistant is ready to use.")
+
+# Add the artistic pills illustration to the bottom left
+st.markdown(
+    """
+    <style>
+    .pill-illustration {
+        position: fixed;
+        bottom: 20px;
+        left: 20px;
+        width: 150px;
+        height: auto;
+        z-index: 1000;
+    }
+    </style>
+    <div class="pill-illustration">
+        <img src="data:image/svg+xml;base64,{}" alt="Artistic Pills Illustration">
+    </div>
+    """.format(
+        base64.b64encode(open("artistic_pills_illustration.svg", "rb").read()).decode("utf-8")
+    ),
+    unsafe_allow_html=True
+)
