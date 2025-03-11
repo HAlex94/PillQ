@@ -118,8 +118,51 @@ def fetch_ndcs_for_name_drugsfda(name_str, limit=50):
                                 "Strength": strength
                             })
                         else:
-                            # For each fallback code, store a row
+                            # For each fallback code, get package NDCs
                             for ndc_val in fallback_list:
+                                # Get package-level NDCs for this product
+                                package_ndcs = get_package_ndcs_for_product(ndc_val)
+                                
+                                if package_ndcs:
+                                    # Add each package NDC as a separate row
+                                    for package_ndc in package_ndcs:
+                                        results_list.append({
+                                            "Brand Name": brand,
+                                            "Generic Name": gen,
+                                            "NDC": package_ndc,
+                                            "Dosage Form": dform,
+                                            "Route": route,
+                                            "Strength": strength
+                                        })
+                                else:
+                                    # If no package NDCs found, use the product NDC
+                                    results_list.append({
+                                        "Brand Name": brand,
+                                        "Generic Name": gen,
+                                        "NDC": ndc_val,
+                                        "Dosage Form": dform,
+                                        "Route": route,
+                                        "Strength": strength
+                                    })
+                    else:
+                        # If openfda product_ndc is found, get package NDCs for each product
+                        for ndc_val in ndcs:
+                            # Get package-level NDCs for this product
+                            package_ndcs = get_package_ndcs_for_product(ndc_val)
+                            
+                            if package_ndcs:
+                                # Add each package NDC as a separate row
+                                for package_ndc in package_ndcs:
+                                    results_list.append({
+                                        "Brand Name": brand,
+                                        "Generic Name": gen,
+                                        "NDC": package_ndc,
+                                        "Dosage Form": dform,
+                                        "Route": route,
+                                        "Strength": strength
+                                    })
+                            else:
+                                # If no package NDCs found, use the product NDC
                                 results_list.append({
                                     "Brand Name": brand,
                                     "Generic Name": gen,
@@ -128,24 +171,43 @@ def fetch_ndcs_for_name_drugsfda(name_str, limit=50):
                                     "Route": route,
                                     "Strength": strength
                                 })
-                    else:
-                        # If openfda product_ndc is found
-                        for ndc_val in ndcs:
-                            results_list.append({
-                                "Brand Name": brand,
-                                "Generic Name": gen,
-                                "NDC": ndc_val,
-                                "Dosage Form": dform,
-                                "Route": route,
-                                "Strength": strength
-                            })
-        else:
-            st.warning(f"No matching products found in drugsfda for that name: {name_str}.")
-    
     except Exception as e:
-        st.error(f"Error fetching from drugsfda for name '{name_str}': {e}")
+        st.error(f"Error retrieving data from openFDA drugsfda endpoint: {e}")
     
+    # Sort by the Brand Name column
+    if results_list:
+        results_list = sorted(results_list, key=lambda x: x["Brand Name"])
     return results_list
+
+def get_package_ndcs_for_product(product_ndc):
+    """
+    Given a product NDC, retrieve all package NDCs associated with it from the NDC directory.
+    Returns a list of package NDCs.
+    """
+    base_url = "https://api.fda.gov/drug/ndc.json"
+    query = f'product_ndc:"{product_ndc}"'
+    params = {"search": query, "limit": 1}
+    
+    try:
+        resp = requests.get(base_url, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        
+        if "results" in data and data["results"]:
+            result = data["results"][0]
+            packaging = result.get("packaging", [])
+            package_ndcs = []
+            
+            for pkg in packaging:
+                package_ndc = pkg.get("package_ndc")
+                if package_ndc:
+                    package_ndcs.append(package_ndc)
+            
+            return package_ndcs
+    except Exception as e:
+        print(f"Error retrieving package NDCs: {e}")
+    
+    return []
 
 # ------------------------------------------------------------------
 # 2) Searching by NDC with your existing logic (ensures source is set properly)
