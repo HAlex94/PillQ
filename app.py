@@ -68,17 +68,32 @@ def fetch_ndcs_for_name_drugsfda(name_str, limit=50):
                     dform = prod.get("dosage_form", "Not Available")
                     route = prod.get("route", "Not Available")
                     
+                    # Get manufacturer information
+                    manufacturer = item.get("sponsor_name", "Not Available")
+                    
+                    # Get or create product description
+                    prod_type = prod.get("product_type", "")
+                    marketing_status = prod.get("marketing_status", "")
+                    product_description = f"{prod_type} {marketing_status}".strip()
+                    if not product_description:
+                        product_description = "Not Available"
+                    
                     # active_ingredients => parse name + strength
                     ai_list = prod.get("active_ingredients", [])
                     if ai_list:
                         pieces = []
+                        strength_only = []
                         for ai in ai_list:
                             nm = ai.get("name", "")
                             stg = ai.get("strength", "")
                             if nm or stg:
                                 pieces.append(f"{nm} {stg}".strip())
-                        strength = " | ".join(pieces) if pieces else "Not Available"
+                                strength_only.append(stg.strip())
+                        active_ingr = " | ".join(pieces) if pieces else "Not Available"
+                        # Extract only the strength part
+                        strength = " | ".join(strength_only) if strength_only else "Not Available"
                     else:
+                        active_ingr = "Not Available"
                         strength = "Not Available"
                     
                     # If generic_name is "Not Available", use active_ingredients as "gen"
@@ -104,18 +119,20 @@ def fetch_ndcs_for_name_drugsfda(name_str, limit=50):
                             fallback_name = gen if gen != "Not Available" else uppercase_term
                         
                         from urllib.parse import quote
-                        # Use your fallback function from the example above
+                        # Use fallback function to get NDCs
                         fallback_list = fallback_ndc_search(fallback_name)
                         
                         if not fallback_list:
                             # No fallback NDC found
                             results_list.append({
+                                "NDC": "Not Available",
                                 "Brand Name": brand,
                                 "Generic Name": gen,
-                                "NDC": "Not Available",
-                                "Dosage Form": dform,
+                                "Strength": strength,
                                 "Route": route,
-                                "Strength": strength
+                                "Dosage Form": dform,
+                                "Manufacturer": manufacturer,
+                                "Product Description": product_description
                             })
                         else:
                             # For each fallback code, get package NDCs
@@ -127,22 +144,26 @@ def fetch_ndcs_for_name_drugsfda(name_str, limit=50):
                                     # Add each package NDC as a separate row
                                     for package_ndc in package_ndcs:
                                         results_list.append({
+                                            "NDC": package_ndc,
                                             "Brand Name": brand,
                                             "Generic Name": gen,
-                                            "NDC": package_ndc,
-                                            "Dosage Form": dform,
+                                            "Strength": strength,
                                             "Route": route,
-                                            "Strength": strength
+                                            "Dosage Form": dform,
+                                            "Manufacturer": manufacturer,
+                                            "Product Description": product_description
                                         })
                                 else:
                                     # If no package NDCs found, use the product NDC
                                     results_list.append({
+                                        "NDC": ndc_val,
                                         "Brand Name": brand,
                                         "Generic Name": gen,
-                                        "NDC": ndc_val,
-                                        "Dosage Form": dform,
+                                        "Strength": strength,
                                         "Route": route,
-                                        "Strength": strength
+                                        "Dosage Form": dform,
+                                        "Manufacturer": manufacturer,
+                                        "Product Description": product_description
                                     })
                     else:
                         # If openfda product_ndc is found, get package NDCs for each product
@@ -154,22 +175,26 @@ def fetch_ndcs_for_name_drugsfda(name_str, limit=50):
                                 # Add each package NDC as a separate row
                                 for package_ndc in package_ndcs:
                                     results_list.append({
+                                        "NDC": package_ndc,
                                         "Brand Name": brand,
                                         "Generic Name": gen,
-                                        "NDC": package_ndc,
-                                        "Dosage Form": dform,
+                                        "Strength": strength,
                                         "Route": route,
-                                        "Strength": strength
+                                        "Dosage Form": dform,
+                                        "Manufacturer": manufacturer,
+                                        "Product Description": product_description
                                     })
                             else:
                                 # If no package NDCs found, use the product NDC
                                 results_list.append({
+                                    "NDC": ndc_val,
                                     "Brand Name": brand,
                                     "Generic Name": gen,
-                                    "NDC": ndc_val,
-                                    "Dosage Form": dform,
+                                    "Strength": strength,
                                     "Route": route,
-                                    "Strength": strength
+                                    "Dosage Form": dform,
+                                    "Manufacturer": manufacturer,
+                                    "Product Description": product_description
                                 })
     except Exception as e:
         st.error(f"Error retrieving data from openFDA drugsfda endpoint: {e}")
@@ -178,36 +203,6 @@ def fetch_ndcs_for_name_drugsfda(name_str, limit=50):
     if results_list:
         results_list = sorted(results_list, key=lambda x: x["Brand Name"])
     return results_list
-
-def get_package_ndcs_for_product(product_ndc):
-    """
-    Given a product NDC, retrieve all package NDCs associated with it from the NDC directory.
-    Returns a list of package NDCs.
-    """
-    base_url = "https://api.fda.gov/drug/ndc.json"
-    query = f'product_ndc:"{product_ndc}"'
-    params = {"search": query, "limit": 1}
-    
-    try:
-        resp = requests.get(base_url, params=params, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-        
-        if "results" in data and data["results"]:
-            result = data["results"][0]
-            packaging = result.get("packaging", [])
-            package_ndcs = []
-            
-            for pkg in packaging:
-                package_ndc = pkg.get("package_ndc")
-                if package_ndc:
-                    package_ndcs.append(package_ndc)
-            
-            return package_ndcs
-    except Exception as e:
-        print(f"Error retrieving package NDCs: {e}")
-    
-    return []
 
 # ------------------------------------------------------------------
 # 2) Searching by NDC with your existing logic (ensures source is set properly)
@@ -578,32 +573,62 @@ with tab1:
                                 mime="text/plain"
                             )
 
-    # AI Assistant Section - Only show when requested
-    st.markdown("---")
-    show_assistant = st.checkbox("Show AI Assistant", value=False, key="show_assistant")
-    if show_assistant:
-        # Integrate AI chatbot here
-        st.markdown("### PillQ AI Assistant")
-        st.markdown("Ask me anything about drug information and I'll help you find answers.")
+def get_package_ndcs_for_product(product_ndc):
+    """
+    Given a product NDC, retrieve all package NDCs associated with it from the NDC directory.
+    Returns a list of package NDCs.
+    """
+    base_url = "https://api.fda.gov/drug/ndc.json"
+    query = f'product_ndc:"{product_ndc}"'
+    params = {"search": query, "limit": 1}
+    
+    try:
+        resp = requests.get(base_url, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
         
-        user_question = st.text_area("Your question:", key="ai_question", height=100)
-        
-        if st.button("Ask AI Assistant"):
-            if user_question:
-                # Placeholder for AI response
-                with st.spinner("Thinking..."):
-                    # Replace with actual AI integration
-                    time.sleep(2)
-                    st.markdown(f"""
-                    **Answer:** 
-                    
-                    I see you're asking about: "{user_question}"
-                    
-                    This is a placeholder for the AI assistant's response. 
-                    In the real implementation, this would call the AI model.
-                    """)
-            else:
-                st.warning("Please enter a question first.")
+        if "results" in data and data["results"]:
+            result = data["results"][0]
+            packaging = result.get("packaging", [])
+            package_ndcs = []
+            
+            for pkg in packaging:
+                package_ndc = pkg.get("package_ndc")
+                if package_ndc:
+                    package_ndcs.append(package_ndc)
+            
+            return package_ndcs
+    except Exception as e:
+        print(f"Error retrieving package NDCs: {e}")
+    
+    return []
+
+# AI Assistant Section - Only show when requested
+st.markdown("---")
+show_assistant = st.checkbox("Show AI Assistant", value=False, key="show_assistant")
+if show_assistant:
+    # Integrate AI chatbot here
+    st.markdown("### PillQ AI Assistant")
+    st.markdown("Ask me anything about drug information and I'll help you find answers.")
+    
+    user_question = st.text_area("Your question:", key="ai_question", height=100)
+    
+    if st.button("Ask AI Assistant"):
+        if user_question:
+            # Placeholder for AI response
+            with st.spinner("Thinking..."):
+                # Replace with actual AI integration
+                time.sleep(2)
+                st.markdown(f"""
+                **Answer:** 
+                
+                I see you're asking about: "{user_question}"
+                
+                This is a placeholder for the AI assistant's response. 
+                In the real implementation, this would call the AI model.
+                """)
+        else:
+            st.warning("Please enter a question first.")
 
 with tab2:
     st.subheader("File Upload")
