@@ -1,15 +1,11 @@
 import streamlit as st
-st.set_page_config(page_title="PillQ – Pill Queries, Simplified", layout="wide")
-
 import pandas as pd
-import io
 import requests
+import io
+import urllib
 import urllib.parse
-
 from helper_functions import (
     get_openfda_searchable_fields,
-    get_product_image,
-    get_product_ndc,
     get_label_field,
     get_combined_label_field,
     get_setid_from_search,
@@ -17,6 +13,68 @@ from helper_functions import (
     unify_source_string,
     convert_df
 )
+import json
+import os
+from pathlib import Path
+import time
+
+# ------------------------------------------------------------------
+# Setup and Configuration
+# ------------------------------------------------------------------
+
+# Set page config
+st.set_page_config(
+    page_title="PillQ - Pharmaceutical Information Tool",
+    page_icon="💊",
+    layout="wide",
+    initial_sidebar_state="collapsed"
+)
+
+# Settings and session state initialization
+if 'openai_api_key' not in st.session_state:
+    st.session_state.openai_api_key = ""
+if 'ollama_url' not in st.session_state:
+    st.session_state.ollama_url = "http://localhost:11434"
+if 'deepseek_api_key' not in st.session_state:
+    st.session_state.deepseek_api_key = ""
+if 'selected_model' not in st.session_state:
+    st.session_state.selected_model = "OpenAI"
+if 'model_name' not in st.session_state:
+    st.session_state.model_name = "gpt-3.5-turbo"
+
+# Load settings from file if it exists
+def load_settings():
+    settings_path = Path("settings.json")
+    if settings_path.exists():
+        try:
+            with open(settings_path, "r") as f:
+                settings = json.load(f)
+                st.session_state.openai_api_key = settings.get("openai_api_key", "")
+                st.session_state.ollama_url = settings.get("ollama_url", "http://localhost:11434")
+                st.session_state.deepseek_api_key = settings.get("deepseek_api_key", "")
+                st.session_state.selected_model = settings.get("selected_model", "OpenAI")
+                st.session_state.model_name = settings.get("model_name", "gpt-3.5-turbo")
+        except Exception as e:
+            print(f"Error loading settings: {e}")
+
+# Save settings to file
+def save_settings():
+    settings_path = Path("settings.json")
+    try:
+        settings = {
+            "openai_api_key": st.session_state.openai_api_key,
+            "ollama_url": st.session_state.ollama_url,
+            "deepseek_api_key": st.session_state.deepseek_api_key,
+            "selected_model": st.session_state.selected_model,
+            "model_name": st.session_state.model_name
+        }
+        with open(settings_path, "w") as f:
+            json.dump(settings, f)
+    except Exception as e:
+        print(f"Error saving settings: {e}")
+
+# Load settings at startup
+load_settings()
 
 # ------------------------------------------------------------------
 # Title & Description
@@ -270,9 +328,9 @@ def get_single_item_source(data_dict, labels, include_source):
         return "openFDA + DailyMed"
 
 # ------------------------------------------------------------------
-# Layout with two tabs
+# Layout with three tabs: Single/Multiple Search, File Upload, Settings
 # ------------------------------------------------------------------
-tab1, tab2 = st.tabs(["Single/Multiple Search", "File Upload"])
+tab1, tab2, tab3 = st.tabs(["Single/Multiple Search", "File Upload", "Settings"])
 
 with tab1:
     col_left, col_right = st.columns([1, 2])
@@ -611,24 +669,128 @@ if show_assistant:
     st.markdown("### PillQ AI Assistant")
     st.markdown("Ask me anything about drug information and I'll help you find answers.")
     
+    # Initialize chat history if it doesn't exist
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []
+    
+    # Display chat history
+    for i, message in enumerate(st.session_state.chat_history):
+        if message["role"] == "user":
+            st.write(f"**You:** {message['content']}")
+        else:
+            st.write(f"**AI:** {message['content']}")
+    
     user_question = st.text_area("Your question:", key="ai_question", height=100)
     
     if st.button("Ask AI Assistant"):
         if user_question:
-            # Placeholder for AI response
+            # Display the user message
+            st.write(f"**You:** {user_question}")
+            st.session_state.chat_history.append({"role": "user", "content": user_question})
+            
+            # Call the AI assistant with the question
             with st.spinner("Thinking..."):
-                # Replace with actual AI integration
-                time.sleep(2)
-                st.markdown(f"""
-                **Answer:** 
+                response = call_ai_assistant(user_question)
                 
-                I see you're asking about: "{user_question}"
-                
-                This is a placeholder for the AI assistant's response. 
-                In the real implementation, this would call the AI model.
-                """)
+            # Display the AI response
+            st.write(f"**AI:** {response}")
+            st.session_state.chat_history.append({"role": "assistant", "content": response})
+            
+            # Clear the question input
+            st.session_state.ai_question = ""
         else:
             st.warning("Please enter a question first.")
+
+# Function to call AI assistant
+def call_ai_assistant(question, context=""):
+    """
+    Call the selected AI model with the question and return the response.
+    Supports OpenAI, Ollama, and DeepSeek.
+    """
+    provider = st.session_state.selected_model
+    
+    if provider == "OpenAI":
+        if not st.session_state.openai_api_key:
+            return "Error: OpenAI API key is not configured. Please set it up in the Settings tab."
+        
+        try:
+            import openai
+            openai.api_key = st.session_state.openai_api_key
+            
+            prompt = f"You are an AI assistant for a pharmaceutical information tool called PillQ. Answer the following question about drugs or pharmaceuticals:\n\n{question}"
+            if context:
+                prompt += f"\n\nContext information: {context}"
+            
+            response = openai.chat.completions.create(
+                model=st.session_state.model_name,
+                messages=[
+                    {"role": "system", "content": "You are a helpful pharmaceutical assistant."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=1000
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            return f"Error calling OpenAI API: {str(e)}"
+    
+    elif provider == "Ollama":
+        if not st.session_state.ollama_url:
+            return "Error: Ollama URL is not configured. Please set it up in the Settings tab."
+        
+        try:
+            url = f"{st.session_state.ollama_url}/api/chat"
+            
+            prompt = f"You are an AI assistant for a pharmaceutical information tool called PillQ. Answer the following question about drugs or pharmaceuticals:\n\n{question}"
+            if context:
+                prompt += f"\n\nContext information: {context}"
+            
+            payload = {
+                "model": st.session_state.model_name,
+                "messages": [
+                    {"role": "system", "content": "You are a helpful pharmaceutical assistant."},
+                    {"role": "user", "content": prompt}
+                ],
+                "stream": False
+            }
+            
+            response = requests.post(url, json=payload)
+            response.raise_for_status()
+            return response.json()["message"]["content"]
+        except Exception as e:
+            return f"Error calling Ollama API: {str(e)}"
+    
+    elif provider == "DeepSeek":
+        if not st.session_state.deepseek_api_key:
+            return "Error: DeepSeek API key is not configured. Please set it up in the Settings tab."
+        
+        try:
+            url = "https://api.deepseek.com/v1/chat/completions"
+            
+            prompt = f"You are an AI assistant for a pharmaceutical information tool called PillQ. Answer the following question about drugs or pharmaceuticals:\n\n{question}"
+            if context:
+                prompt += f"\n\nContext information: {context}"
+            
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {st.session_state.deepseek_api_key}"
+            }
+            
+            payload = {
+                "model": st.session_state.model_name,
+                "messages": [
+                    {"role": "system", "content": "You are a helpful pharmaceutical assistant."},
+                    {"role": "user", "content": prompt}
+                ]
+            }
+            
+            response = requests.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+            return response.json()["choices"][0]["message"]["content"]
+        except Exception as e:
+            return f"Error calling DeepSeek API: {str(e)}"
+    
+    else:
+        return "Error: Unknown AI provider selected."
 
 with tab2:
     st.subheader("File Upload")
@@ -740,3 +902,102 @@ with tab2:
                         )
         except Exception as e:
             st.error(f"Error processing uploaded file: {e}")
+
+with tab3:
+    st.subheader("AI Assistant Settings")
+    st.markdown("Configure your AI assistant to use different providers. API keys and settings are stored locally on your machine.")
+    
+    # AI Provider selection
+    st.subheader("AI Provider")
+    provider_col1, provider_col2 = st.columns([1, 2])
+    
+    with provider_col1:
+        provider_options = ["OpenAI", "Ollama", "DeepSeek"]
+        selected_provider = st.selectbox(
+            "Select AI Provider",
+            options=provider_options,
+            index=provider_options.index(st.session_state.selected_model)
+        )
+        
+        if selected_provider != st.session_state.selected_model:
+            st.session_state.selected_model = selected_provider
+    
+    with provider_col2:
+        # Different model options based on selected provider
+        if selected_provider == "OpenAI":
+            model_options = ["gpt-3.5-turbo", "gpt-4", "gpt-4-turbo"]
+            model_name = st.selectbox(
+                "Select Model",
+                options=model_options,
+                index=model_options.index(st.session_state.model_name) if st.session_state.model_name in model_options else 0
+            )
+        elif selected_provider == "Ollama":
+            model_options = ["llama2", "mistral", "mixtral", "gemma", "phi"]
+            model_name = st.selectbox(
+                "Select Model",
+                options=model_options,
+                index=0
+            )
+        elif selected_provider == "DeepSeek":
+            model_options = ["deepseek-chat", "deepseek-coder"]
+            model_name = st.selectbox(
+                "Select Model",
+                options=model_options,
+                index=0
+            )
+        
+        if model_name != st.session_state.model_name:
+            st.session_state.model_name = model_name
+    
+    # API Key configuration
+    st.subheader("API Configuration")
+    
+    # OpenAI configuration
+    if selected_provider == "OpenAI":
+        st.markdown("##### OpenAI API Key")
+        openai_key = st.text_input(
+            "Enter your OpenAI API Key",
+            value=st.session_state.openai_api_key,
+            type="password",
+            help="Your OpenAI API key. Get one at https://platform.openai.com/api-keys"
+        )
+        if openai_key != st.session_state.openai_api_key:
+            st.session_state.openai_api_key = openai_key
+    
+    # Ollama configuration
+    elif selected_provider == "Ollama":
+        st.markdown("##### Ollama URL")
+        st.markdown("Ollama runs locally on your machine. Make sure you have it installed and running.")
+        ollama_url = st.text_input(
+            "Ollama URL",
+            value=st.session_state.ollama_url,
+            help="The URL of your Ollama instance. Default is http://localhost:11434"
+        )
+        if ollama_url != st.session_state.ollama_url:
+            st.session_state.ollama_url = ollama_url
+    
+    # DeepSeek configuration
+    elif selected_provider == "DeepSeek":
+        st.markdown("##### DeepSeek API Key")
+        deepseek_key = st.text_input(
+            "Enter your DeepSeek API Key",
+            value=st.session_state.deepseek_api_key,
+            type="password",
+            help="Your DeepSeek API key. Get one at https://platform.deepseek.com/"
+        )
+        if deepseek_key != st.session_state.deepseek_api_key:
+            st.session_state.deepseek_api_key = deepseek_key
+    
+    # Save settings button
+    if st.button("Save Settings"):
+        save_settings()
+        st.success("Settings saved successfully!")
+    
+    # Test connection button
+    if st.button("Test Connection"):
+        with st.spinner("Testing connection..."):
+            test_result = call_ai_assistant("This is a test message to check the connection.")
+            if "Error" in test_result:
+                st.error(test_result)
+            else:
+                st.success("Connection successful! Your AI assistant is ready to use.")
