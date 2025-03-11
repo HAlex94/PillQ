@@ -11,7 +11,9 @@ from helper_functions import (
     get_setid_from_search,
     fallback_ndc_search,
     unify_source_string,
-    convert_df
+    convert_df,
+    get_product_image,
+    get_product_ndc
 )
 import json
 import os
@@ -102,6 +104,37 @@ Pill Queries, Simplified.
 # 1) Enhanced function to fetch brand/generic name info from the drugsfda endpoint
 #    so we can retrieve dosage_form, route, strength, etc.
 # ------------------------------------------------------------------
+
+# Define this function before it's used in fetch_ndcs_for_name_drugsfda
+def get_package_ndcs_for_product(product_ndc):
+    """
+    Given a product NDC, retrieve all package NDCs associated with it from the NDC directory.
+    Returns a list of package NDCs.
+    """
+    base_url = "https://api.fda.gov/drug/ndc.json"
+    query = f'product_ndc:"{product_ndc}"'
+    params = {"search": query, "limit": 1}
+    
+    try:
+        resp = requests.get(base_url, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        
+        if "results" in data and data["results"]:
+            result = data["results"][0]
+            packaging = result.get("packaging", [])
+            package_ndcs = []
+            
+            for pkg in packaging:
+                package_ndc = pkg.get("package_ndc")
+                if package_ndc:
+                    package_ndcs.append(package_ndc)
+            
+            return package_ndcs
+    except Exception as e:
+        print(f"Error retrieving package NDCs: {e}")
+    
+    return []
 
 def fetch_ndcs_for_name_drugsfda(name_str, limit=50):
     """
