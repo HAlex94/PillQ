@@ -1052,23 +1052,30 @@ with tab3:
                 st.success("Connection successful! Your AI assistant is ready to use.")
 
 # Add the artistic pills illustration to the bottom left
-st.markdown(
-    """
-    <style>
-    .pill-illustration {
-        position: fixed;
-        bottom: 20px;
-        left: 20px;
-        width: 150px;
-        height: auto;
-        z-index: 1000;
-    }
-    </style>
-    <div class="pill-illustration">
-        <img src="data:image/svg+xml;base64,{}" alt="Artistic Pills Illustration">
-    </div>
-    """.format(
-        base64.b64encode(open("artistic_pills_illustration.svg", "rb").read()).decode("utf-8")
-    ),
-    unsafe_allow_html=True
-)
+try:
+    # Read the SVG file and convert to base64
+    svg_path = os.path.join(os.path.dirname(__file__), "artistic_pills_illustration.svg")
+    if os.path.exists(svg_path):
+        with open(svg_path, "rb") as f:
+            svg_data = base64.b64encode(f.read()).decode("utf-8")
+            
+        st.markdown(
+            f"""
+            <style>
+            .pill-illustration {{
+                position: fixed;
+                bottom: 20px;
+                left: 20px;
+                width: 150px;
+                height: auto;
+                z-index: 1000;
+            }}
+            </style>
+            <div class="pill-illustration">
+                <img src="data:image/svg+xml;base64,{svg_data}" alt="Artistic Pills Illustration">
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+except Exception as e:
+    st.write(f"Note: Illustration couldn't be loaded. This doesn't affect app functionality.")
