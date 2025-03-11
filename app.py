@@ -1,13 +1,11 @@
 import streamlit as st
-st.set_page_config(page_title="PillQ 💊 – Pill Queries, Simplified", layout="wide")
-
 import pandas as pd
-import io
-import requests
-import urllib.parse
-import os
-import base64
 import json
+import uuid
+from datetime import datetime
+from openai import OpenAI
+import requests
+import os
 
 from helper_functions import (
     get_openfda_searchable_fields,
@@ -18,379 +16,65 @@ from helper_functions import (
     get_setid_from_search,
     fallback_ndc_search,
     unify_source_string,
+    fetch_ndcs_for_name_drugsfda,
+    search_ndc,
+    search_name_placeholder,
+    get_single_item_source,
     convert_df
 )
 
 # ------------------------------------------------------------------
+# Initialize session state
+# ------------------------------------------------------------------
+if 'chat_history' not in st.session_state:
+    st.session_state.chat_history = []
+
+if 'chat_id' not in st.session_state:
+    st.session_state.chat_id = str(uuid.uuid4())
+
+if 'ai_provider' not in st.session_state:
+    st.session_state.ai_provider = "ollama"  # Default to free model
+    
+if 'openai_api_key' not in st.session_state:
+    st.session_state.openai_api_key = ""
+    
+if 'deepseek_api_key' not in st.session_state:
+    st.session_state.deepseek_api_key = ""
+
+if 'selected_ndcs' not in st.session_state:
+    st.session_state.selected_ndcs = []
+
+if 'search_results' not in st.session_state:
+    st.session_state.search_results = []
+
+if 'current_ai_model' not in st.session_state:
+    st.session_state.current_ai_model = 'openai'  # Default to OpenAI
+
+if 'export_form_submitted' not in st.session_state:
+    st.session_state.export_form_submitted = False
+
+# ------------------------------------------------------------------
 # Title & Description
 # ------------------------------------------------------------------
-st.title("PillQ 💊 – Pill Queries, Simplified")
+st.set_page_config(
+    page_title="PillQ - Drug Lookup Tool",
+    page_icon="💊",
+    layout="wide"
+)
+
+# Page Header and Description
+st.title("💊 PillQ - Drug Information Lookup")
 st.markdown("""
-Spend less time searching and more time making decisions.  
-**PillQ** deciphers complex drug data in an instant—whether for formulary management, verification, or documentation.  
+PillQ deciphers complex drug data in an instant—whether for formulary management, verification, or documentation.  
 Pill Queries, Simplified.
 """)
 
-# ------------------------------------------------------------------
-# 1) Enhanced function to fetch brand/generic name info from the drugsfda endpoint
-#    so we can retrieve dosage_form, route, strength, etc.
-# ------------------------------------------------------------------
-
-def fetch_ndcs_for_name_drugsfda(name_str, limit=50):
-    """
-    Query the openFDA 'drugsfda' endpoint by brand_name OR generic_name.
-    If no openfda.product_ndc is found, fallback to /drug/ndc endpoint
-    by brand or chemical name to retrieve actual NDC codes.
-    """
-    base_url = "https://api.fda.gov/drug/drugsfda.json"
-    
-    uppercase_term = name_str.upper()
-    
-    # E.g. (products.brand_name:"ACETAMINOPHEN" OR products.generic_name:"ACETAMINOPHEN")
-    raw_expr = f'(products.brand_name:"{uppercase_term}" OR products.generic_name:"{uppercase_term}")'
-    safe_chars = '()+:"'
-    encoded_expr = urllib.parse.quote(raw_expr, safe=safe_chars)
-    
-    params = {
-        "search": encoded_expr,
-        "limit": limit
-    }
-    
-    results_list = []
-    try:
-        resp = requests.get(base_url, params=params, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-        
-        if "results" in data and data["results"]:
-            for item in data["results"]:
-                products = item.get("products", [])
-                for prod in products:
-                    brand = prod.get("brand_name", "Not Available")
-                    gen = prod.get("generic_name", "Not Available")
-                    dform = prod.get("dosage_form", "Not Available")
-                    route = prod.get("route", "Not Available")
-                    
-                    # active_ingredients => parse name + strength
-                    ai_list = prod.get("active_ingredients", [])
-                    if ai_list:
-                        pieces = []
-                        for ai in ai_list:
-                            nm = ai.get("name", "")
-                            stg = ai.get("strength", "")
-                            if nm or stg:
-                                pieces.append(f"{nm} {stg}".strip())
-                        strength = " | ".join(pieces) if pieces else "Not Available"
-                    else:
-                        strength = "Not Available"
-                    
-                    # If generic_name is "Not Available", use active_ingredients as "gen"
-                    if gen == "Not Available" and ai_list:
-                        chem_names = []
-                        for ai in ai_list:
-                            nm = ai.get("name", "")
-                            if nm:
-                                chem_names.append(nm)
-                        if chem_names:
-                            gen = " / ".join(set(chem_names))
-                    
-                    # Check openfda sub-object for product_ndc
-                    ofda = prod.get("openfda", {})
-                    ndcs = ofda.get("product_ndc", [])
-                    
-                    if not ndcs:
-                        # Fallback approach: if brand != "Not Available", we try brand
-                        # else if brand is also "Not Available", we fallback to 'gen'
-                        if brand != "Not Available":
-                            fallback_name = brand
-                        else:
-                            fallback_name = gen if gen != "Not Available" else uppercase_term
-                        
-                        from urllib.parse import quote
-                        # Use your fallback function from the example above
-                        fallback_list = fallback_ndc_search(fallback_name)
-                        
-                        if not fallback_list:
-                            # No fallback NDC found
-                            results_list.append({
-                                "Brand Name": brand,
-                                "Generic Name": gen,
-                                "NDC": "Not Available",
-                                "Dosage Form": dform,
-                                "Route": route,
-                                "Strength": strength
-                            })
-                        else:
-                            # For each fallback code, get package NDCs
-                            for ndc_val in fallback_list:
-                                # Get package-level NDCs for this product
-                                package_ndcs = get_package_ndcs_for_product(ndc_val)
-                                
-                                if package_ndcs:
-                                    # Add each package NDC as a separate row
-                                    for package_ndc in package_ndcs:
-                                        results_list.append({
-                                            "Brand Name": brand,
-                                            "Generic Name": gen,
-                                            "NDC": package_ndc,
-                                            "Dosage Form": dform,
-                                            "Route": route,
-                                            "Strength": strength
-                                        })
-                                else:
-                                    # If no package NDCs found, use the product NDC
-                                    results_list.append({
-                                        "Brand Name": brand,
-                                        "Generic Name": gen,
-                                        "NDC": ndc_val,
-                                        "Dosage Form": dform,
-                                        "Route": route,
-                                        "Strength": strength
-                                    })
-                    else:
-                        # If openfda product_ndc is found, get package NDCs for each product
-                        for ndc_val in ndcs:
-                            # Get package-level NDCs for this product
-                            package_ndcs = get_package_ndcs_for_product(ndc_val)
-                            
-                            if package_ndcs:
-                                # Add each package NDC as a separate row
-                                for package_ndc in package_ndcs:
-                                    results_list.append({
-                                        "Brand Name": brand,
-                                        "Generic Name": gen,
-                                        "NDC": package_ndc,
-                                        "Dosage Form": dform,
-                                        "Route": route,
-                                        "Strength": strength
-                                    })
-                            else:
-                                # If no package NDCs found, use the product NDC
-                                results_list.append({
-                                    "Brand Name": brand,
-                                    "Generic Name": gen,
-                                    "NDC": ndc_val,
-                                    "Dosage Form": dform,
-                                    "Route": route,
-                                    "Strength": strength
-                                })
-    except Exception as e:
-        st.error(f"Error retrieving data from openFDA drugsfda endpoint: {e}")
-    
-    # Sort by the Brand Name column
-    if results_list:
-        results_list = sorted(results_list, key=lambda x: x["Brand Name"])
-    return results_list
-
-def get_package_ndcs_for_product(product_ndc):
-    """
-    Given a product NDC, retrieve all package NDCs associated with it from the NDC directory.
-    Returns a list of package NDCs.
-    """
-    base_url = "https://api.fda.gov/drug/ndc.json"
-    query = f'product_ndc:"{product_ndc}"'
-    params = {"search": query, "limit": 1}
-    
-    try:
-        resp = requests.get(base_url, params=params, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-        
-        if "results" in data and data["results"]:
-            result = data["results"][0]
-            packaging = result.get("packaging", [])
-            package_ndcs = []
-            
-            for pkg in packaging:
-                package_ndc = pkg.get("package_ndc")
-                if package_ndc:
-                    package_ndcs.append(package_ndc)
-            
-            return package_ndcs
-    except Exception as e:
-        print(f"Error retrieving package NDCs: {e}")
-    
-    return []
-
-# ------------------------------------------------------------------
-# 2) Searching by NDC with your existing logic (ensures source is set properly)
-# ------------------------------------------------------------------
-def search_ndc(ndc_str, labels, include_source=False):
-    """
-    For each label in 'labels':
-      - If 'active_ingredient' or 'inactive_ingredient', call get_combined_label_field -> 'openFDA + DailyMed'
-      - Else call get_label_field -> might return 'openFDA' or 'DailyMed' in the second value 'src'.
-    """
-    result = {"NDC": ndc_str}
-    for lbl in labels:
-        if lbl in ["active_ingredient", "inactive_ingredient"]:
-            data_list = get_combined_label_field(
-                ndc_str,
-                lbl,
-                ["active ingredient"] if lbl == "active_ingredient" else ["inactive ingredient"]
-            )
-            result[lbl] = ", ".join(data_list)
-            if include_source:
-                # We'll assume 'openFDA + DailyMed' for these, since get_combined_label_field uses both
-                result[lbl + "_source"] = "openFDA + DailyMed"
-        else:
-            data_vals, src = get_label_field(ndc_str, lbl, [lbl.replace("_", " ")])
-            result[lbl] = ", ".join(data_vals)
-            if include_source:
-                unified = unify_source_string(src)
-                result[lbl + "_source"] = unified
-    return result
-
-# ------------------------------------------------------------------
-# 3) Searching by Name (placeholder for multiple names)
-#    If the user typed multiple brand/generic names, we do a simple approach.
-#    If the user typed a single name, we do 'fetch_ndcs_for_name_drugsfda'
-# ------------------------------------------------------------------
-def search_name_placeholder(name_str, labels, include_source=False):
-    data_dict = {"Name": name_str}
-    for lbl in labels:
-        data_dict[lbl] = f"Placeholder for {lbl} (Name: {name_str})"
-        if include_source:
-            data_dict[lbl + "_source"] = "openFDA"
-    return data_dict
-
-def get_single_item_source(data_dict, labels, include_source):
-    """
-    We parse each 'lbl + "_source"' for 'openfda' or 'dailymed'.
-    If we see both, it's 'openFDA + DailyMed'. If we see only one, that's it. Else 'None'.
-    """
-    if not include_source:
-        return "None"
-    sources_used = set()
-    for lbl in labels:
-        src_key = lbl + "_source"
-        if src_key in data_dict:
-            src = data_dict[src_key].lower()
-            if "openfda" in src:
-                sources_used.add("openFDA")
-            if "dailymed" in src:
-                sources_used.add("DailyMed")
-    if len(sources_used) == 0:
-        return "None"
-    elif len(sources_used) == 1:
-        return next(iter(sources_used))
-    else:
-        return "openFDA + DailyMed"
+# Create tabs
+tab1, tab2, tab3 = st.tabs(["Single/Multiple Search", "File Upload", "Settings"])
 
 # ------------------------------------------------------------------
 # Layout with three tabs
 # ------------------------------------------------------------------
-tab1, tab2, tab3 = st.tabs(["Single/Multiple Search", "File Upload", "Settings"])
-
-# Initialize session state for AI assistant and settings
-if 'ai_response' not in st.session_state:
-    st.session_state.ai_response = ""
-if 'chat_history' not in st.session_state:
-    st.session_state.chat_history = []
-if 'api_key' not in st.session_state:
-    st.session_state.api_key = ""
-if 'provider' not in st.session_state:
-    st.session_state.provider = "HuggingFace"  # Default to free option
-if 'model_name' not in st.session_state:
-    st.session_state.model_name = "google/flan-t5-small"  # Default to a free model
-
-def get_ai_response(prompt, provider, api_key=None, model_name=None):
-    """Get response from the selected AI model."""
-    try:
-        # Add the prompt to the history
-        history = st.session_state.chat_history
-        history.append({"role": "user", "content": prompt})
-        
-        if provider == "OpenAI":
-            # OpenAI API
-            import openai
-            openai.api_key = api_key
-            
-            messages = []
-            for message in history:
-                messages.append({"role": message["role"], "content": message["content"]})
-            
-            response = openai.ChatCompletion.create(
-                model=model_name,
-                messages=messages
-            )
-            answer = response.choices[0].message.content
-        
-        elif provider == "Ollama":
-            # Ollama API
-            ollama_url = "http://localhost:11434/api/chat"
-            
-            headers = {"Content-Type": "application/json"}
-            messages = []
-            for message in history:
-                messages.append({"role": message["role"], "content": message["content"]})
-            
-            data = {
-                "model": model_name,
-                "messages": messages
-            }
-            
-            response = requests.post(ollama_url, headers=headers, json=data, timeout=60)
-            response.raise_for_status()
-            answer = response.json()['message']['content']
-        
-        elif provider == "DeepSeek":
-            # DeepSeek API
-            deepseek_url = "https://api.deepseek.com/v1/chat/completions"
-            
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}"
-            }
-            
-            messages = []
-            for message in history:
-                messages.append({"role": message["role"], "content": message["content"]})
-            
-            data = {
-                "model": model_name,
-                "messages": messages
-            }
-            
-            response = requests.post(deepseek_url, headers=headers, json=data, timeout=60)
-            response.raise_for_status()
-            answer = response.json()['choices'][0]['message']['content']
-        
-        elif provider == "HuggingFace":
-            # Use HuggingFace Transformers (no API key required for many models)
-            try:
-                from transformers import pipeline
-                
-                # Initialize the pipeline with the specified model
-                generator = pipeline("text-generation", model=model_name)
-                
-                # Combine history into a single string for context
-                context = ""
-                for message in history:
-                    prefix = "User: " if message["role"] == "user" else "Assistant: "
-                    context += prefix + message["content"] + "\n"
-                
-                # Generate response
-                response = generator(context + "Assistant: ", max_length=200, do_sample=True)
-                
-                # Extract answer from the generated text
-                full_response = response[0]['generated_text']
-                answer = full_response.split("Assistant: ")[-1].strip()
-                
-            except Exception as e:
-                answer = f"Error using HuggingFace model: {str(e)}"
-        
-        else:
-            answer = "Selected AI provider not implemented."
-        
-        # Add the answer to history
-        history.append({"role": "assistant", "content": answer})
-        
-        return answer
-    
-    except Exception as e:
-        return f"Error: {str(e)}"
-
 with tab1:
     col_left, col_right = st.columns([1, 2])
 
@@ -402,10 +86,6 @@ with tab1:
             st.session_state.multi_input = ""
         if 'search_performed' not in st.session_state:
             st.session_state.search_performed = False
-        if 'search_results' not in st.session_state:
-            st.session_state.search_results = []
-        if 'selected_ndcs' not in st.session_state:
-            st.session_state.selected_ndcs = []
         
         # Function to update search state
         def update_search():
@@ -447,7 +127,7 @@ with tab1:
             key="fields_single_search"
         )
         
-        include_sources = st.checkbox("Include data sources", value=True, key="sources_single_search")
+        include_sources = st.checkbox("Include data sources", value=False, key="sources_single_search")
         
         # Store the preview button state and handle clicks
         preview_btn = st.button("Preview Results", on_click=update_search)
@@ -468,7 +148,7 @@ with tab1:
             with st.spinner(f"Processing {len(items)} items..."):
                 for item in items:
                     if item.replace('-', '').isdigit():
-                        result = search_ndc(item, labels_to_get, include_sources)
+                        result = search_ndc(item, labels_to_get, include_source=include_sources)
                         all_results.append(result)  
                         
                         img_url = get_product_image(item)
@@ -490,76 +170,285 @@ with tab1:
                             # Create container for search results
                             st.markdown("### Search Results")
                             
-                            # Create DataFrame from search results
-                            df = pd.DataFrame(name_results)
+                            # Create DataFrame from search results with specific fields and order
+                            df_display = pd.DataFrame(name_results)[["NDC", "brand_name", "generic_name", "strength", 
+                                                                   "route", "dosage_form", "manufacturer", "package_description"]]
                             
-                            # Use Streamlit's data_editor to display the table
-                            edited_df = st.data_editor(
-                                df,
-                                column_config={
-                                    "Brand Name": st.column_config.TextColumn("Brand Name"),
-                                    "Generic Name": st.column_config.TextColumn("Generic Name"),
-                                    "NDC": st.column_config.TextColumn("NDC"),
-                                    "Dosage Form": st.column_config.TextColumn("Dosage Form"),
-                                    "Route": st.column_config.TextColumn("Route"),
-                                    "Strength": st.column_config.TextColumn("Strength"),
-                                },
-                                hide_index=True,
-                                use_container_width=True,
-                                key="data_editor_name_results"
+                            # Calculate dynamic height based on number of rows, capped at ~8 rows
+                            num_rows = len(df_display)
+                            # Base height per row (~40px) + header (~45px) + some padding
+                            dynamic_height = min(max(num_rows * 40 + 45, 100), 375)  # Min height 100px, max ~8 rows (375px)
+                            
+                            # Display the table with static data
+                            st.dataframe(df_display, height=dynamic_height, use_container_width=True)
+                            
+                            # Create a list of NDC options for the multiselect
+                            ndc_options = [ndc_item['NDC'] for ndc_item in name_results]
+                            
+                            # Step 1: Create a multiselect for the NDCs - use empty list when options change
+                            st.markdown("### Select NDC(s) to preview")
+                            
+                            # Only use existing selections if they're still valid options
+                            valid_defaults = [ndc for ndc in st.session_state.selected_ndcs if ndc in ndc_options]
+                            
+                            selected_ndcs = st.multiselect(
+                                "Choose one or more NDCs to view details",
+                                options=ndc_options,
+                                default=valid_defaults,
+                                key="ndc_multiselect"
                             )
                             
-                            # Multiselect for exporting specific rows
-                            if not edited_df.empty:
-                                st.markdown("### Export Options")
+                            # Update the session state
+                            st.session_state.selected_ndcs = selected_ndcs
+                            
+                            # Display detailed information for selected NDCs
+                            if selected_ndcs:
+                                st.markdown("---")
+                                st.markdown("### Detailed Information for Selected NDC(s)")
                                 
-                                export_format = st.radio("Export Format", ["CSV", "Excel", "JSON"], horizontal=True)
-                                
-                                # Allow selection of specific NDCs for export
-                                selected_ndcs = st.multiselect(
-                                    "Select NDCs for Detailed Export",
-                                    options=edited_df["NDC"].tolist(),
-                                    help="Select one or more NDCs to view detailed information"
-                                )
-                                
-                                # Export button for the entire table
-                                export_table = edited_df
-                                
-                                if st.button("Export Table Results"):
-                                    if export_format == "CSV":
-                                        csv = convert_df(export_table, "CSV")
-                                        st.download_button(
-                                            label="Download CSV",
-                                            data=csv,
-                                            file_name=f"{item}_results.csv",
-                                            mime="text/csv"
+                                # For each selected NDC
+                                for ndc in selected_ndcs:
+                                    try:
+                                        # Get detailed data for this NDC
+                                        detailed_data = search_ndc(ndc, labels_to_get, include_source=include_sources)
+                                        
+                                        # Create an expander for each NDC
+                                        with st.expander(f"**NDC: {ndc}**", expanded=True):
+                                            # Create tabs for different ways to view the data
+                                            view_tabs = st.tabs(["Table View", "Key-Value View", "JSON View"])
+                                            
+                                            # Tab 1: Table View
+                                            with view_tabs[0]:
+                                                # Convert dictionary to DataFrame
+                                                detailed_df = pd.DataFrame([detailed_data])
+                                                
+                                                # Transpose the DataFrame for better display
+                                                detailed_df_transposed = detailed_df.T.reset_index()
+                                                detailed_df_transposed.columns = ["Field", "Value"]
+                                                
+                                                # Add a Source column if include_sources is True
+                                                if include_sources:
+                                                    # Create a new column for Source
+                                                    sources = []
+                                                    for field in detailed_df_transposed["Field"]:
+                                                        if field.endswith("_source"):
+                                                            sources.append("N/A")
+                                                        else:
+                                                            # Get source for this field
+                                                            source = get_single_item_source(detailed_data, field)
+                                                            sources.append(source)
+                                                    
+                                                    # Add Source column to DataFrame
+                                                    detailed_df_transposed["Source"] = sources
+                                                    
+                                                    # Filter out _source fields
+                                                    detailed_df_transposed = detailed_df_transposed[~detailed_df_transposed["Field"].str.endswith("_source")]
+                                                
+                                                # Display the transposed DataFrame
+                                                st.dataframe(detailed_df_transposed, use_container_width=True)
+                                            
+                                            # Tab 2: Key-Value View
+                                            with view_tabs[1]:
+                                                # Create columns for Field/Value pairs
+                                                for field, value in detailed_data.items():
+                                                    # Skip source fields
+                                                    if field.endswith("_source"):
+                                                        continue
+                                                    
+                                                    # Create columns for field and value
+                                                    cols = st.columns([1, 3])
+                                                    
+                                                    # Display field name in first column
+                                                    cols[0].markdown(f"**{field}:**")
+                                                    
+                                                    # Display value in second column
+                                                    cols[1].write(value)
+                                                    
+                                                    # Display source if include_sources is True
+                                                    if include_sources:
+                                                        source = get_single_item_source(detailed_data, field)
+                                                        cols[1].caption(f"Source: {source}")
+                                            
+                                            # Tab 3: JSON View
+                                            with view_tabs[2]:
+                                                # Display the raw JSON
+                                                st.json(detailed_data)
+                                                
+                                            # Add a divider after each NDC section
+                                            st.divider()
+                                    except Exception as e:
+                                        st.error(f"Error loading data for NDC {ndc}: {e}")
+                            
+                            # Step 2: Show export options ONLY when export button is clicked
+                            st.markdown("---")
+                            
+                            # Create a container for export options to maintain state
+                            export_container = st.container()
+                            
+                            # Button to open export options
+                            if not st.session_state.get('show_export_options', False):
+                                if st.button("Open Export Options"):
+                                    st.session_state.show_export_options = True
+                                    st.session_state.export_form_submitted = False
+                                    st.rerun()
+                            
+                            # Show export options if the button was clicked
+                            if st.session_state.get('show_export_options', False):
+                                with export_container:
+                                    st.markdown("### Export Search Results Table")
+                                    export_table = df_display.copy()
+                                    
+                                    # Create a form to maintain state during submission
+                                    with st.form(key="export_form"):
+                                        # Add option to include search field data in export
+                                        include_field_data = st.checkbox("Include data from selected search fields", value=True, key="include_fields_export")
+                                        
+                                        # Add option to select specific columns to export
+                                        st.markdown("#### Choose columns to include in export")
+                                        
+                                        # Default columns (always selected)
+                                        default_columns = ["NDC", "brand_name", "generic_name", "strength", "route", "dosage_form", "manufacturer", "package_description"]
+                                        
+                                        # Let user choose which base columns to include
+                                        base_columns_to_export = st.multiselect(
+                                            "Base table columns",
+                                            options=default_columns,
+                                            default=default_columns,
+                                            key="base_columns_export"
                                         )
-                                    elif export_format == "Excel":
-                                        excel = convert_df(export_table, "Excel")
-                                        st.download_button(
-                                            label="Download Excel",
-                                            data=excel,
-                                            file_name=f"{item}_results.xlsx",
-                                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                                        )
-                                    else:  # JSON
-                                        json_data = convert_df(export_table, "JSON")
-                                        st.download_button(
-                                            label="Download JSON",
-                                            data=json_data,
-                                            file_name=f"{item}_results.json",
-                                            mime="application/json"
-                                        )
+                                        
+                                        # Field columns selection (only shown if include_field_data is checked)
+                                        field_columns_to_export = []
+                                        if include_field_data and labels_to_get:
+                                            field_columns_to_export = st.multiselect(
+                                                "Additional field data columns",
+                                                options=labels_to_get,
+                                                default=labels_to_get,
+                                                key="field_columns_export"
+                                            )
+                                        
+                                        # Submit button for the form
+                                        export_submitted = st.form_submit_button("Prepare Export")
+                                        
+                                        if export_submitted:
+                                            st.session_state.export_form_submitted = True
+                                            st.session_state.include_field_data = include_field_data
+                                            st.session_state.base_columns = base_columns_to_export
+                                            st.session_state.field_columns = field_columns_to_export
+                                    
+                                    # Handle form submission outside the form
+                                    if st.session_state.export_form_submitted:
+                                        # Process the export based on selections stored in session state
+                                        include_field_data = st.session_state.include_field_data
+                                        base_columns_to_export = st.session_state.base_columns
+                                        field_columns_to_export = st.session_state.field_columns
+                                        
+                                        # If user wants to include field data, fetch and add it to the export table
+                                        if include_field_data and labels_to_get and field_columns_to_export:
+                                            # Create a progress bar for field data fetching
+                                            fetch_progress = st.progress(0)
+                                            st.write("Fetching field data for each NDC...")
+                                            
+                                            # Create columns for each selected field
+                                            for field in field_columns_to_export:
+                                                if field not in export_table.columns:
+                                                    export_table[field] = None
+                                            
+                                            # Fetch detailed data for each NDC and add the fields
+                                            for i, row in export_table.iterrows():
+                                                ndc = row['NDC']
+                                                # Update progress bar
+                                                fetch_progress.progress((i + 1) / len(export_table))
+                                                
+                                                try:
+                                                    # Get detailed data for this NDC
+                                                    detailed_data = search_ndc(ndc, labels_to_get, include_source=include_sources)
+                                                    
+                                                    # Add each selected field to the export table
+                                                    for field in field_columns_to_export:
+                                                        if field in detailed_data:
+                                                            export_table.at[i, field] = detailed_data[field]
+                                                except Exception as e:
+                                                    st.warning(f"Could not fetch detailed data for NDC {ndc}: {e}")
+                                            
+                                            # Complete the progress
+                                            fetch_progress.progress(1.0)
+                                            st.success("Field data fetched successfully!")
+                                            
+                                            # Final list of columns to export
+                                            final_columns_to_export = base_columns_to_export + [col for col in field_columns_to_export if col in labels_to_get]
+                                        else:
+                                            final_columns_to_export = base_columns_to_export
+                                        
+                                        # Filter the export table to include only the selected columns
+                                        filtered_export_table = export_table[final_columns_to_export]
+                                        
+                                        # Provide download options
+                                        if export_format == "CSV":
+                                            csv = convert_df(filtered_export_table, "CSV")
+                                            st.download_button(
+                                                label="Download CSV",
+                                                data=csv,
+                                                file_name="search_results.csv",
+                                                mime="text/csv",
+                                                key="download_csv_button"
+                                            )
+                                        elif export_format == "Excel":
+                                            excel = convert_df(filtered_export_table, "Excel")
+                                            st.download_button(
+                                                label="Download Excel",
+                                                data=excel,
+                                                file_name="search_results.xlsx",
+                                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                                key="download_excel_button"
+                                            )
+                                        elif export_format == "TXT":
+                                            txt = convert_df(filtered_export_table, "TXT")
+                                            st.download_button(
+                                                label="Download TXT",
+                                                data=txt,
+                                                file_name="search_results.txt",
+                                                mime="text/plain",
+                                                key="download_txt_button"
+                                            )
+                                        else:  # JSON
+                                            json_str = convert_df(filtered_export_table, "JSON")
+                                            st.download_button(
+                                                label="Download JSON",
+                                                data=json_str,
+                                                file_name="search_results.json",
+                                                mime="application/json",
+                                                key="download_json_button"
+                                            )
+                                        
+                                        # Add a button to close the export options
+                                        if st.button("Close Export Options"):
+                                            st.session_state.show_export_options = False
+                                            st.session_state.export_form_submitted = False
+                                            st.rerun()
             
-            # Export all combined results if not name search
-            if all_results and len(all_results) == len(items) and all(isinstance(item, dict) for item in all_results):
-                df_combined = pd.DataFrame(all_results)
-                combined_data = convert_df(df_combined, export_format)
+            if all_results:
+                if len(all_results) == 1:
+                    if export_format == "JSON":
+                        st.json(all_results[0])
+                    elif export_format == "CSV":
+                        st.dataframe(pd.DataFrame([all_results[0]]))
+                    elif export_format == "Excel":
+                        st.dataframe(pd.DataFrame([all_results[0]]))
+                    elif export_format == "TXT":
+                        st.text(pd.DataFrame([all_results[0]]).to_csv(sep="\t", index=False))
+                else:
+                    df = pd.DataFrame(all_results)
+                    
+                    if 'ndc' in df.columns:
+                        df = df.rename(columns={'ndc': 'NDC'})
+                        
+                    st.dataframe(df)
                 
                 st.download_button(
-                    label=f"Download {export_format}",
-                    data=combined_data,
-                    file_name=f"ndc_search_results.{export_format.lower()}",
+                    label=f"Download as {export_format}",
+                    data=convert_df(pd.DataFrame(all_results), export_format),
+                    file_name=f"pillq_export.{export_format.lower()}",
                     mime="text/csv" if export_format == "CSV" else "application/octet-stream"
                 )
 
@@ -604,292 +493,694 @@ with tab1:
     # AI Assistant Section - Only show when requested
     st.markdown("---")
     show_assistant = st.checkbox("Show AI Assistant", value=False, key="show_assistant")
+    
     if show_assistant:
         st.subheader("AI Assistant")
-        st.markdown(f"Using **{st.session_state.provider}** with model **{st.session_state.model_name}**")
-        st.markdown("Ask me questions about drugs, NDCs, or how to use this app.")
         
-        # Display chat history
-        for message in st.session_state.chat_history:
-            if message["role"] == "user":
-                st.markdown(f"**You:** {message['content']}")
+        col1, col2 = st.columns([2, 1])
+        
+        model_options = {
+            "gemini": "Gemini 1.0 Pro (Google, Free API)",
+            "cloudflare": "Claude Instant (Cloudflare, Free)",
+            "zephyr": "Zephyr 7B (HuggingFace, Free Cloud)",
+            "ollama": "Llama 3 (Ollama, Free Local)",
+            "cohere": "Command (Cohere, Free API)",
+            "anthropic": "Claude 3 Haiku (Anthropic, Free API)",
+            "openai": "GPT-3.5 Turbo (OpenAI, API Required)",
+            "deepseek": "DeepSeek Chat (DeepSeek, API Required)"
+        }
+        
+        st.session_state.current_ai_model = st.selectbox(
+            "Select AI Model",
+            options=list(model_options.keys()),
+            format_func=lambda x: model_options[x],
+            index=list(model_options.keys()).index(st.session_state.current_ai_model),
+            key="ai_model_selector"
+        )
+        
+        with st.container(height=250, border=True):
+            for message in st.session_state.chat_history:
+                if message["role"] == "user":
+                    st.markdown(f"<div style='background-color:#2E4057; padding:5px; border-radius:3px; margin-bottom:5px; color:white;'><strong>You:</strong> {message['content']}</div>", unsafe_allow_html=True)
+                else:
+                    st.markdown(f"<div style='background-color:#1E293B; padding:5px; border-radius:3px; margin-bottom:5px; color:white;'><strong>Assistant:</strong> {message['content']}</div>", unsafe_allow_html=True)
+        
+        input_col, button_col = st.columns([3, 1])
+        
+        user_input = st.text_area("Ask about drugs, ingredients, or how to use this tool", height=70, key="chat_input")
+        
+        st.write("")  # Add some vertical spacing
+        submit_button = st.button("Ask", type="primary", key="submit_chat", use_container_width=True)
+        
+        def query_drug_info(ndc_or_name, fields_to_get=None):
+            if fields_to_get is None:
+                fields_to_get = ["active_ingredient", "inactive_ingredient", "indications_and_usage", "dosage_form"]
+            
+            if str(ndc_or_name).replace('-', '').isdigit():
+                return search_ndc(ndc_or_name, fields_to_get, include_source=True)
             else:
-                st.markdown(f"**Assistant:** {message['content']}")
+                return fetch_ndcs_for_name_drugsfda(ndc_or_name)
         
-        # Input for user question
-        user_question = st.text_area("Your question:", key="user_question")
+        def get_available_fields():
+            return list(get_openfda_searchable_fields())
         
-        # Process button
-        if st.button("Ask"):
-            if user_question:
-                # Placeholder for AI response
-                with st.spinner("Thinking..."):
-                    ai_response = get_ai_response(user_question, st.session_state.provider, st.session_state.api_key, st.session_state.model_name)
-                    st.session_state.ai_response = ai_response
-                    st.markdown(f"**Answer:** {ai_response}")
-                    st.experimental_rerun()  # Refresh to show the new message in chat history
-            else:
-                st.warning("Please enter a question first.")
+        if submit_button or user_input and user_input != st.session_state.get('previous_input', ''):
+            st.session_state.previous_input = user_input
+            
+            st.session_state.chat_history.append({"role": "user", "content": user_input})
+            
+            with st.spinner("Thinking..."):
+                try:
+                    if st.session_state.current_ai_model == "openai" and st.session_state.openai_api_key:
+                        client = OpenAI(api_key=st.session_state.openai_api_key)
+                        
+                        system_message = """
+                        You are PillQ Assistant, an AI helper specialized in pharmaceutical information. 
+                        You can help users find information about drugs, analyze ingredients, and understand medication data.
+                        
+                        You have access to the following tools:
+                        1. query_drug_info(ndc_or_name, fields_to_get): Look up drug information by NDC code or name
+                        2. get_available_fields(): Get a list of all available data fields from OpenFDA
+                        
+                        When users ask about specific drugs, use the query_drug_info tool to fetch accurate information.
+                        Explain pharmaceutical concepts in clear, accessible language.
+                        """
+                        
+                        messages = [
+                            {"role": "system", "content": system_message}
+                        ]
+                        
+                        for message in st.session_state.chat_history[-10:]:
+                            messages.append({"role": message["role"], "content": message["content"]})
+                        
+                        tools = [
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "query_drug_info",
+                                    "description": "Get information about a drug by NDC or name",
+                                    "parameters": {
+                                        "type": "object",
+                                        "properties": {
+                                            "ndc_or_name": {
+                                                "type": "string",
+                                                "description": "NDC code or drug name to search for"
+                                            },
+                                            "fields_to_get": {
+                                                "type": "array",
+                                                "items": {"type": "string"},
+                                                "description": "List of fields to get from OpenFDA"
+                                            }
+                                        },
+                                        "required": ["ndc_or_name"]
+                                    }
+                                }
+                            },
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "get_available_fields",
+                                    "description": "Get a list of all available data fields from OpenFDA",
+                                    "parameters": {
+                                        "type": "object",
+                                        "properties": {}
+                                    }
+                                }
+                            }
+                        ]
+                        
+                        response = client.chat.completions.create(
+                            model="gpt-3.5-turbo-0125",
+                            messages=messages,
+                            tools=tools,
+                            tool_choice="auto"
+                        )
+                        
+                        response_message = response.choices[0].message
+                        tool_calls = response_message.tool_calls
+                        
+                        if tool_calls:
+                            for tool_call in tool_calls:
+                                function_name = tool_call.function.name
+                                function_args = json.loads(tool_call.function.arguments)
+                                
+                                if function_name == "query_drug_info":
+                                    ndc_or_name = function_args.get("ndc_or_name")
+                                    fields_to_get = function_args.get("fields_to_get")
+                                    
+                                    function_response = query_drug_info(ndc_or_name, fields_to_get)
+                                    
+                                    messages.append({
+                                        "role": "tool",
+                                        "tool_call_id": tool_call.id,
+                                        "name": function_name,
+                                        "content": json.dumps(function_response)
+                                    })
+                                
+                                elif function_name == "get_available_fields":
+                                    function_response = get_available_fields()
+                                    
+                                    messages.append({
+                                        "role": "tool",
+                                        "tool_call_id": tool_call.id,
+                                        "name": function_name,
+                                        "content": json.dumps(function_response)
+                                    })
+                            
+                            second_response = client.chat.completions.create(
+                                model="gpt-3.5-turbo-0125",
+                                messages=messages
+                            )
+                            
+                            final_response = second_response.choices[0].message.content
+                        else:
+                            final_response = response_message.content
+                    
+                    elif st.session_state.current_ai_model == "deepseek" and st.session_state.deepseek_api_key:
+                        headers = {
+                            "Authorization": f"Bearer {st.session_state.deepseek_api_key}",
+                            "Content-Type": "application/json"
+                        }
+                        
+                        messages = []
+                        for message in st.session_state.chat_history[-10:]:
+                            messages.append({"role": message["role"], "content": message["content"]})
+                        
+                        context = ""
+                        if any(keyword in user_input.lower() for keyword in ["drug", "ndc", "information", "ingredient"]):
+                            words = user_input.split()
+                            for word in words:
+                                if word.replace('-', '').isdigit() or len(word) > 4:
+                                    try:
+                                        drug_info = query_drug_info(word)
+                                        context = f"Drug information for {word}: {json.dumps(drug_info)}\n\n"
+                                        break
+                                    except Exception:
+                                        pass
+                        
+                        system_message = f"""You are PillQ Assistant, an AI helper specialized in pharmaceutical information.
+                        {context}
+                        Provide helpful, accurate information about drugs. Explain pharmaceutical concepts in clear language."""
+                        
+                        data = {
+                            "model": "deepseek-chat",
+                            "messages": [{"role": "system", "content": system_message}] + messages
+                        }
+                        
+                        response = requests.post("https://api.deepseek.com/v1/chat/completions", headers=headers, json=data)
+                        if response.status_code == 200:
+                            final_response = response.json()["choices"][0]["message"]["content"]
+                        else:
+                            final_response = f"Error with DeepSeek API: {response.text}"
+                    
+                    elif st.session_state.current_ai_model == "gemini":
+                        try:
+                            import google.generativeai as genai
+                            
+                            gemini_api_key = st.session_state.get('gemini_api_key', '')
+                            
+                            if not gemini_api_key:
+                                final_response = """Please add your Google Gemini API key in the Settings tab to use this model.
+                                
+Get a free API key at https://aistudio.google.com/app/apikey"""
+                            else:
+                                genai.configure(api_key=gemini_api_key)
+                                
+                                context = ""
+                                if any(keyword in user_input.lower() for keyword in ["drug", "ndc", "information", "ingredient"]):
+                                    words = user_input.split()
+                                    for word in words:
+                                        if word.replace('-', '').isdigit() or len(word) > 4:
+                                            try:
+                                                drug_info = query_drug_info(word)
+                                                context = f"Drug information for {word}: {json.dumps(drug_info)}\n\n"
+                                                break
+                                            except Exception:
+                                                pass
+                                
+                                system_prompt = f"""You are PillQ Assistant, an AI helper specialized in pharmaceutical information.
+                                {context}
+                                Provide helpful, accurate information about drugs. Explain pharmaceutical concepts in clear language."""
+                                
+                                chat_history = []
+                                for message in st.session_state.chat_history[-5:]:
+                                    role = "user" if message["role"] == "user" else "model"
+                                    chat_history.append({"role": role, "parts": [message["content"]]})
+                                
+                                model = genai.GenerativeModel('gemini-1.0-pro')
+                                
+                                chat = model.start_chat(history=chat_history)
+                                
+                                response = chat.send_message(user_input)
+                                final_response = response.text
+                        except Exception as e:
+                            final_response = f"""I'm sorry, I couldn't connect to the Google Gemini API. Error: {str(e)}
+                            
+Please make sure you've added a valid API key in the Settings tab."""
+                    
+                    elif st.session_state.current_ai_model == "cloudflare":
+                        try:
+                            context = ""
+                            if any(keyword in user_input.lower() for keyword in ["drug", "ndc", "information", "ingredient"]):
+                                words = user_input.split()
+                                for word in words:
+                                    if word.replace('-', '').isdigit() or len(word) > 4:
+                                        try:
+                                            drug_info = query_drug_info(word)
+                                            context = f"Drug information for {word}: {json.dumps(drug_info)}\n\n"
+                                            break
+                                        except Exception:
+                                            pass
+                            
+                            conversation = []
+                            for message in st.session_state.chat_history[-5:]:
+                                role_prefix = "Human: " if message["role"] == "user" else "Assistant: "
+                                conversation.append(f"{role_prefix}{message['content']}")
+                            
+                            conversation_history = "\n".join(conversation)
+                            
+                            system_prompt = f"""You are PillQ Assistant, an AI helper specialized in pharmaceutical information.
+                            {context}
+                            Provide helpful, accurate information about drugs. Explain pharmaceutical concepts in clear language."""
+                            
+                            full_prompt = f"{system_prompt}\n\n{conversation_history}\nHuman: {user_input}\nAssistant:"
+                            
+                            response = requests.post(
+                                "https://api.cloudflare.com/client/v4/accounts/1decaca3cbd0c7ebffc7cd487f91dce0/ai/run/@cf/claude/claude-instant-1.2",
+                                headers={"Content-Type": "application/json"},
+                                json={"prompt": full_prompt}
+                            )
+                            
+                            if response.status_code == 200:
+                                final_response = response.json()["result"]["response"].strip()
+                            else:
+                                final_response = """I'm sorry, I couldn't connect to the Cloudflare Workers AI service.
+                                
+This free service might be experiencing high traffic. Please try again in a moment or select a different model."""
+                        except Exception as e:
+                            final_response = f"""I'm sorry, I couldn't connect to the Cloudflare Workers AI service. Error: {str(e)}
+                            
+This free service might be experiencing high traffic. Please try again in a moment or select a different model."""
+                    
+                    elif st.session_state.current_ai_model == "cohere":
+                        try:
+                            import cohere
+                            
+                            cohere_api_key = st.session_state.get('cohere_api_key', '')
+                            
+                            if not cohere_api_key:
+                                final_response = """Please add your Cohere API key in the Settings tab to use this model.
+                                
+Get a free API key at https://dashboard.cohere.com/api-keys"""
+                            else:
+                                co = cohere.Client(cohere_api_key)
+                                
+                                context = ""
+                                if any(keyword in user_input.lower() for keyword in ["drug", "ndc", "information", "ingredient"]):
+                                    words = user_input.split()
+                                    for word in words:
+                                        if word.replace('-', '').isdigit() or len(word) > 4:
+                                            try:
+                                                drug_info = query_drug_info(word)
+                                                context = f"Drug information for {word}: {json.dumps(drug_info)}\n\n"
+                                                break
+                                            except Exception:
+                                                pass
+                                
+                                system_prompt = f"""You are PillQ Assistant, an AI helper specialized in pharmaceutical information.
+                                {context}
+                                Provide helpful, accurate information about drugs. Explain pharmaceutical concepts in clear language."""
+                                
+                                chat_history = []
+                                for message in st.session_state.chat_history[-5:]:
+                                    role = "USER" if message["role"] == "user" else "CHATBOT"
+                                    chat_history.append({"role": role, "message": message["content"]})
+                                
+                                response = co.chat(
+                                    message=user_input,
+                                    chat_history=chat_history,
+                                    model="command",
+                                    preamble=system_prompt
+                                )
+                                
+                                final_response = response.text
+                        except Exception as e:
+                            final_response = f"""I'm sorry, I couldn't connect to the Cohere API. Error: {str(e)}
+                            
+Please make sure you've added a valid API key in the Settings tab."""
+                    
+                    elif st.session_state.current_ai_model == "anthropic":
+                        try:
+                            import anthropic
+                            
+                            claude_api_key = st.session_state.get('claude_api_key', '')
+                            
+                            if not claude_api_key:
+                                final_response = """Please add your Anthropic Claude API key in the Settings tab to use this model.
+                                
+Get a free API key at https://console.anthropic.com/settings/keys"""
+                            else:
+                                client = anthropic.Anthropic(api_key=claude_api_key)
+                                
+                                context = ""
+                                if any(keyword in user_input.lower() for keyword in ["drug", "ndc", "information", "ingredient"]):
+                                    words = user_input.split()
+                                    for word in words:
+                                        if word.replace('-', '').isdigit() or len(word) > 4:
+                                            try:
+                                                drug_info = query_drug_info(word)
+                                                context = f"Drug information for {word}: {json.dumps(drug_info)}\n\n"
+                                                break
+                                            except Exception:
+                                                pass
+                                
+                                system_message = f"""You are PillQ Assistant, an AI helper specialized in pharmaceutical information.
+                                {context}
+                                Provide helpful, accurate information about drugs. Explain pharmaceutical concepts in clear language."""
+                                
+                                messages = [{"role": "system", "content": system_message}]
+                                
+                                for message in st.session_state.chat_history[-5:]:
+                                    role = "user" if message["role"] == "user" else "assistant"
+                                    messages.append({"role": role, "content": message["content"]})
+                                
+                                messages.append({"role": "user", "content": user_input})
+                                
+                                response = client.messages.create(
+                                    model="claude-3-haiku-20240307",
+                                    max_tokens=1000,
+                                    messages=messages
+                                )
+                                
+                                final_response = response.content[0].text
+                        except Exception as e:
+                            final_response = f"""I'm sorry, I couldn't connect to the Anthropic Claude API. Error: {str(e)}
+                            
+Please make sure you've added a valid API key in the Settings tab."""
+                    
+                    elif st.session_state.current_ai_model == "zephyr":
+                        try:
+                            context = ""
+                            if any(keyword in user_input.lower() for keyword in ["drug", "ndc", "information", "ingredient"]):
+                                words = user_input.split()
+                                for word in words:
+                                    if word.replace('-', '').isdigit() or len(word) > 4:
+                                        try:
+                                            drug_info = query_drug_info(word)
+                                            context = f"Drug information for {word}: {json.dumps(drug_info)}\n\n"
+                                            break
+                                        except Exception:
+                                            pass
+                            
+                            system_prompt = f"""You are PillQ Assistant, an AI helper specialized in pharmaceutical information.
+                            {context}
+                            Provide helpful, accurate information about drugs. Explain pharmaceutical concepts in clear language."""
+                            
+                            conversation = []
+                            for message in st.session_state.chat_history[-5:]:
+                                role_prefix = "User: " if message["role"] == "user" else "Assistant: "
+                                conversation.append(f"{role_prefix}{message['content']}")
+                            
+                            conversation_history = "\n".join(conversation)
+                            full_prompt = f"{system_prompt}\n\n{conversation_history}\nUser: {user_input}\nAssistant:"
+                            
+                            response = requests.post(
+                                "https://api-inference.huggingface.co/models/HuggingFaceH4/zephyr-7b-beta",
+                                headers={"Content-Type": "application/json"},
+                                json={"inputs": full_prompt, "parameters": {"max_new_tokens": 500}}
+                            )
+                            
+                            if response.status_code == 200:
+                                generated_text = response.json()[0]["generated_text"]
+                                if "Assistant:" in generated_text:
+                                    final_response = generated_text.split("Assistant:")[-1].strip()
+                                else:
+                                    final_response = generated_text.strip()
+                            else:
+                                final_response = f"""I'm sorry, I couldn't connect to the HuggingFace service. 
+                                
+The free cloud model might be experiencing high traffic. Please try again in a moment or select a different model."""
+                        except Exception as e:
+                            final_response = f"""I'm sorry, I couldn't connect to the HuggingFace service. Error: {str(e)}
+                            
+The free cloud model might be experiencing high traffic. Please try again in a moment or select a different model."""
+                        
+                    else:
+                        try:
+                            context = ""
+                            if any(keyword in user_input.lower() for keyword in ["drug", "ndc", "information", "ingredient"]):
+                                words = user_input.split()
+                                for word in words:
+                                    if word.replace('-', '').isdigit() or len(word) > 4:
+                                        try:
+                                            drug_info = query_drug_info(word)
+                                            context = f"Drug information for {word}: {json.dumps(drug_info)}\n\n"
+                                            break
+                                        except Exception:
+                                            pass
+                            
+                            system_message = f"""You are PillQ Assistant, an AI helper specialized in pharmaceutical information.
+                            {context}
+                            Provide helpful, accurate information about drugs. Explain pharmaceutical concepts in clear language."""
+                            
+                            messages = []
+                            messages.append({"role": "system", "content": system_message})
+                            
+                            for message in st.session_state.chat_history[-5:]:
+                                messages.append({"role": message["role"], "content": message["content"]})
+                            
+                            response = requests.post("http://localhost:11434/api/chat", 
+                                                   json={
+                                                       "model": "llama3:latest", 
+                                                       "messages": messages,
+                                                       "stream": False
+                                                   })
+                            
+                            if response.status_code == 200:
+                                response_data = response.json()
+                                final_response = response_data["message"]["content"]
+                            else:
+                                final_response = """I'm sorry, I couldn't connect to the Ollama service. 
+                                
+To use the free AI assistant, please:
+1. Install Ollama from https://ollama.com/
+2. Run this command in your terminal: `ollama run llama3`
+3. Or configure an API key in the Settings tab."""
+                        except Exception as e:
+                            final_response = f"""I'm sorry, I couldn't connect to the Ollama service. Error: {str(e)}
+                            
+To use the free AI assistant, please:
+1. Install Ollama from https://ollama.com/
+2. Run this command in your terminal: `ollama run llama3`
+3. Or configure an API key in the Settings tab."""
+                        
+                    st.session_state.chat_history.append({"role": "assistant", "content": final_response})
+                
+                except Exception as e:
+                    error_message = f"Error: {str(e)}"
+                    st.error(error_message)
+                    st.session_state.chat_history.append({"role": "assistant", "content": f"I'm sorry, I encountered an error: {error_message}"})
 
+# ==================== TAB 2: File Upload Mode ====================
 with tab2:
-    st.subheader("File Upload")
+    st.subheader("File Upload Mode")
+    file_upload = st.file_uploader("Upload CSV/JSON/Excel/TXT (containing the NDC values)", type=["csv", "json", "xlsx", "txt"])
     
-    uploaded_file = st.file_uploader("Upload a file containing NDC codes:", type=['csv', 'xlsx', 'txt', 'json'])
-    
-    if uploaded_file is not None:
-        # Determine file type from extension
-        file_ext = uploaded_file.name.split('.')[-1].lower()
-        
+    if file_upload:
         try:
-            if file_ext == 'csv':
-                df = pd.read_csv(uploaded_file)
-            elif file_ext == 'xlsx':
-                df = pd.read_excel(uploaded_file)
-            elif file_ext == 'txt':
-                # Try to determine delimiter
-                df = pd.read_csv(uploaded_file, sep=None, engine='python')
-            elif file_ext == 'json':
-                df = pd.read_json(uploaded_file)
+            if file_upload.name.endswith('.csv'):
+                df = pd.read_csv(file_upload)
+            elif file_upload.name.endswith('.json'):
+                df = pd.read_json(file_upload)
+            elif file_upload.name.endswith(('.xlsx', '.xls')):
+                df = pd.read_excel(file_upload)
+            elif file_upload.name.endswith('.txt'):
+                df = pd.read_csv(file_upload, header=None, names=["NDC"])
+            else:
+                st.error("Unsupported file format")
+                st.stop()
             
-            st.success(f"File uploaded successfully! Found {len(df)} rows.")
+            st.subheader("File Preview")
+            st.dataframe(df.head(5))
             
-            # Show the first 5 rows
-            st.write("Preview of your data:")
-            st.dataframe(df.head())
-            
-            # Let user select columns that contain NDC codes
-            st.markdown("### Select columns containing NDC codes")
-            ndc_columns = st.multiselect(
-                "Choose columns containing NDC codes:",
-                options=df.columns.tolist()
+            # Move export format selection before Configure Processing
+            export_format = st.radio(
+                "Output Format",
+                ["CSV", "JSON", "Excel", "TXT"],  # Changed default to CSV by putting it first
+                horizontal=True,
+                key="format_file_upload"
             )
             
-            if ndc_columns:
-                # Let user select which columns to keep
-                st.markdown("### Select columns to keep")
-                keep_columns = st.multiselect(
-                    "Choose columns to keep in output:",
-                    options=df.columns.tolist(),
-                    default=ndc_columns
-                )
-                
-                # Select OpenFDA fields to add
-                st.markdown("### Select OpenFDA fields to add")
-                openfda_fields = st.multiselect(
-                    "Choose OpenFDA fields to add:",
-                    options=field_options,
-                    default=["active_ingredient", "inactive_ingredient"]
-                )
-                
-                include_sources_upload = st.checkbox("Include data sources", value=True)
-                
-                if st.button("Process File"):
-                    with st.spinner("Processing your file..."):
-                        # Create a new dataframe with selected columns
-                        output_df = df[keep_columns].copy()
-                        
-                        # Process NDC columns
-                        for col in ndc_columns:
-                            # Create progress bar
-                            total_rows = len(df)
-                            progress_bar = st.progress(0)
-                            
-                            for i, ndc in enumerate(df[col]):
-                                # Update progress
-                                progress_bar.progress((i + 1) / total_rows)
-                                
-                                # Skip empty/NA values
-                                if pd.isna(ndc) or ndc == "":
-                                    continue
-                                
-                                # Clean the NDC string
-                                ndc_str = str(ndc).strip()
-                                
-                                # Get data for this NDC
-                                try:
-                                    # Get detailed data for this NDC
-                                    detailed_data = search_ndc(ndc_str, openfda_fields, include_sources_upload)
-                                    
-                                    # Add each selected field to the output dataframe
-                                    for field in openfda_fields:
-                                        field_col_name = f"{col}_{field}"
-                                        output_df.at[i, field_col_name] = detailed_data.get(field, "Not Available")
-                                        
-                                        if include_sources_upload and field + "_source" in detailed_data:
-                                            source_col_name = f"{col}_{field}_source"
-                                            output_df.at[i, source_col_name] = detailed_data[field + "_source"]
-                                except Exception as e:
-                                    st.warning(f"Could not fetch detailed data for NDC {ndc_str}: {e}")
-                        
-                        # Display the output
-                        st.success("Processing complete!")
-                        st.write("Output:")
-                        st.dataframe(output_df)
-                        
-                        # Allow downloading the result
-                        output_format = st.radio(
-                            "Output Format",
-                            ["CSV", "Excel", "JSON", "TXT"],
-                            horizontal=True
-                        )
-                        
-                        output_data = convert_df(output_df, output_format)
-                        st.download_button(
-                            label=f"Download {output_format}",
-                            data=output_data,
-                            file_name=f"processed_ndc_data.{output_format.lower()}",
-                            mime="text/csv" if output_format == "CSV" else "application/octet-stream"
-                        )
-        except Exception as e:
-            st.error(f"Error processing uploaded file: {e}")
-
-with tab3:
-    st.subheader("AI Assistant Settings")
-    
-    # Provider selection
-    st.markdown("##### Select AI Provider")
-    provider_options = ["HuggingFace", "OpenAI", "Ollama", "DeepSeek"]
-    selected_provider = st.selectbox(
-        "Choose AI Provider",
-        options=provider_options,
-        index=provider_options.index(st.session_state.provider) if st.session_state.provider in provider_options else 0
-    )
-    
-    # Update provider in session state if changed
-    if selected_provider != st.session_state.provider:
-        st.session_state.provider = selected_provider
-    
-    # Display provider-specific settings
-    st.markdown("---")
-    
-    # OpenAI configuration
-    if selected_provider == "OpenAI":
-        st.markdown("##### OpenAI API Key")
-        api_key = st.text_input("Enter OpenAI API Key", value=st.session_state.api_key, type="password")
-        if api_key != st.session_state.api_key:
-            st.session_state.api_key = api_key
-        
-        # Model selection
-        st.markdown("##### Model Selection")
-        model_options = ["gpt-3.5-turbo", "gpt-4", "gpt-4-turbo"]
-        model_name = st.selectbox(
-            "Choose OpenAI Model",
-            options=model_options,
-            index=model_options.index(st.session_state.model_name) if st.session_state.model_name in model_options else 0
-        )
-        
-        if model_name != st.session_state.model_name:
-            st.session_state.model_name = model_name
-    
-    # Ollama configuration
-    elif selected_provider == "Ollama":
-        st.markdown("##### Ollama Model")
-        st.markdown("Ollama runs locally on your machine. Make sure the Ollama server is running.")
-        model_options = ["llama2", "mistral", "codellama", "vicuna", "orca-mini"]
-        model_name = st.selectbox(
-            "Choose Ollama Model",
-            options=model_options,
-            index=model_options.index(st.session_state.model_name) if st.session_state.model_name in model_options else 0
-        )
-        
-        if model_name != st.session_state.model_name:
-            st.session_state.model_name = model_name
-    
-    # DeepSeek configuration
-    elif selected_provider == "DeepSeek":
-        st.markdown("##### DeepSeek API Key")
-        api_key = st.text_input("Enter DeepSeek API Key", value=st.session_state.api_key, type="password")
-        if api_key != st.session_state.api_key:
-            st.session_state.api_key = api_key
-        
-        # Model selection
-        st.markdown("##### Model Selection")
-        model_options = ["deepseek-chat", "deepseek-coder"]
-        model_name = st.selectbox(
-            "Choose DeepSeek Model",
-            options=model_options,
-            index=model_options.index(st.session_state.model_name) if st.session_state.model_name in model_options else 0
-        )
-        
-        if model_name != st.session_state.model_name:
-            st.session_state.model_name = model_name
-    
-    # HuggingFace configuration
-    elif selected_provider == "HuggingFace":
-        st.markdown("##### HuggingFace Model Name")
-        st.markdown("Enter the name of the HuggingFace model you want to use. You can find the list of available models at https://huggingface.co/models")
-        huggingface_model_name = st.text_input(
-            "Enter HuggingFace Model Name",
-            value=st.session_state.model_name,
-            help="Enter the name of the HuggingFace model you want to use. You can find the list of available models at https://huggingface.co/models",
-            key="huggingface_model_name_settings"
-        )
-        if huggingface_model_name != st.session_state.model_name:
-            st.session_state.model_name = huggingface_model_name
-        
-        st.markdown("##### Free Model Suggestions")
-        st.markdown("These models don't require an API key and can run with minimal resources:")
-        free_models = [
-            "google/flan-t5-small",
-            "facebook/bart-large-cnn", 
-            "google/t5-small",
-            "distilbert/distilbert-base-uncased"
-        ]
-        for model in free_models:
-            if st.button(model, key=f"model_button_{model}"):
-                st.session_state.model_name = model
-                st.experimental_rerun()
-    
-    # Test connection button
-    st.markdown("---")
-    if st.button("Test Connection"):
-        try:
-            with st.spinner("Testing connection..."):
-                # Test prompt
-                test_prompt = "Hello, this is a test message. Please respond with 'Connection successful!'"
-                
-                # Get response
-                test_response = get_ai_response(
-                    test_prompt, 
-                    st.session_state.provider, 
-                    st.session_state.api_key, 
-                    st.session_state.model_name
-                )
-                
-                st.success("Connection successful! Your AI assistant is ready to use.")
-        except Exception as e:
-            st.error(f"Connection failed: {e}")
+            st.subheader("Configure Processing")
             
-    # Reset chat history
+            available_columns = df.columns.tolist()
+            ndc_column = st.selectbox(
+                "Select the column containing NDC codes",
+                options=available_columns,
+                index=available_columns.index("NDC") if "NDC" in available_columns else 0
+            )
+            
+            keep_columns = st.multiselect(
+                "Select columns to keep from your original file",
+                options=available_columns,
+                default=[ndc_column]
+            )
+            
+            try:
+                available_fields = get_openfda_searchable_fields()
+                default_fields = ["active_ingredient", "inactive_ingredient", "indications_and_usage", "dosage_form"]
+                
+                field_options = []
+                for field in default_fields:
+                    if field in available_fields:
+                        field_options.append(field)
+                        
+                for field in sorted(available_fields):
+                    if field not in default_fields:
+                        field_options.append(field)
+            except Exception as e:
+                st.warning(f"Could not fetch all OpenFDA fields: {e}")
+                field_options = ["active_ingredient", "inactive_ingredient", "indications_and_usage", 
+                               "dosage_form", "warnings", "description", "contraindications"]
+            
+            labels_to_get = st.multiselect(
+                "Select OpenFDA fields to retrieve",
+                options=field_options,
+                default=["active_ingredient", "inactive_ingredient"],
+                key="fields_file_upload"
+            )
+            
+            include_sources = st.checkbox("Include data sources", value=False, key="sources_file_upload")
+            
+            process_btn = st.button("Process File")
+            
+            if process_btn:
+                if ndc_column not in keep_columns:
+                    st.warning(f"The NDC column '{ndc_column}' has been automatically added to the output")
+                    keep_columns = [ndc_column] + [col for col in keep_columns if col != ndc_column]
+                
+                with st.spinner(f"Processing {len(df)} NDCs..."):
+                    result_df = df[keep_columns].copy()
+                    
+                    processed_data = []
+                    for ndc in df[ndc_column]:
+                        result = search_ndc(str(ndc), labels_to_get, include_source=include_sources)
+                        processed_data.append(result)
+                    
+                    openfda_df = pd.DataFrame(processed_data)
+                    
+                    for col in openfda_df.columns:
+                        if col != "NDC":  
+                            result_df[col] = openfda_df[col].values
+                
+                st.subheader("Results")
+                st.dataframe(result_df)
+                
+                st.download_button(
+                    label=f"Download Results as {export_format}",
+                    data=convert_df(result_df, export_format),
+                    file_name=f"pillq_enriched_data.{export_format.lower()}",
+                    mime="text/csv" if export_format == "CSV" else "application/octet-stream"
+                )
+                
+        except Exception as e:
+            st.error(f"Error processing file: {e}")
+            st.exception(e)
+
+# ==================== TAB 3: Settings ====================
+with tab3:
+    st.subheader("AI Settings")
+    st.markdown("""
+    Configure your AI assistant settings including API keys for the different models.
+    The model selection can be made directly in the AI Assistant section.
+    """)
+    
+    st.subheader("Free Models with API Keys")
+    
+    st.markdown("### Google Gemini API")
+    st.session_state.gemini_api_key = st.text_input(
+        "Gemini API Key", 
+        value=st.session_state.gemini_api_key if 'gemini_api_key' in st.session_state else "",
+        type="password",
+        key="gemini_key_input"
+    )
+    st.markdown("""
+    Gemini 1.0 Pro is Google's powerful language model with good pharmaceutical knowledge.
+    
+    Get a free API key at [Google AI Studio](https://aistudio.google.com/app/apikey)
+    """)
+    
+    st.markdown("### Cohere API")
+    st.session_state.cohere_api_key = st.text_input(
+        "Cohere API Key", 
+        value=st.session_state.cohere_api_key if 'cohere_api_key' in st.session_state else "",
+        type="password",
+        key="cohere_key_input"
+    )
+    st.markdown("""
+    Cohere's Command model provides excellent response quality with a generous free tier.
+    
+    Get a free API key at [Cohere Dashboard](https://dashboard.cohere.com/api-keys)
+    """)
+    
+    st.markdown("### Anthropic Claude API")
+    st.session_state.claude_api_key = st.text_input(
+        "Claude API Key", 
+        value=st.session_state.claude_api_key if 'claude_api_key' in st.session_state else "",
+        type="password",
+        key="claude_key_input"
+    )
+    st.markdown("""
+    Claude 3 Haiku is Anthropic's fastest and most cost-effective model.
+    
+    Get a free API key at [Anthropic Console](https://console.anthropic.com/settings/keys)
+    """)
+    
+    st.markdown("### OpenAI API")
+    st.session_state.openai_api_key = st.text_input(
+        "OpenAI API Key", 
+        value=st.session_state.openai_api_key if 'openai_api_key' in st.session_state else "",
+        type="password",
+        key="openai_key_input"
+    )
+    st.markdown("""
+    GPT-3.5 Turbo offers good pharmaceutical knowledge (credit card required).
+    
+    Get an API key at [OpenAI Platform](https://platform.openai.com/api-keys)
+    """)
+    
+    st.markdown("### DeepSeek API")
+    st.session_state.deepseek_api_key = st.text_input(
+        "DeepSeek API Key", 
+        value=st.session_state.deepseek_api_key if 'deepseek_api_key' in st.session_state else "",
+        type="password", 
+        key="deepseek_key_input"
+    )
+    st.markdown("""
+    DeepSeek offers powerful language models with good pharmaceutical knowledge.
+    
+    Get an API key at [DeepSeek Platform](https://platform.deepseek.com/)
+    """)
+    
+    st.subheader("Completely Free Models (No API Key)")
+    st.markdown("""
+    **Claude Instant (Cloudflare, Free)**
+    - Uses Claude Instant 1.2 hosted on Cloudflare Workers AI
+    - No API key or installation required
+    - Limited to 10,000 tokens per day
+    
+    **Zephyr 7B (HuggingFace, Free Cloud)**
+    - Uses the Zephyr 7B Beta model hosted on HuggingFace's Inference API
+    - No API key or installation required
+    - May have rate limits during high traffic periods
+    
+    **Llama 3 (Ollama, Free Local)**
+    - Requires downloading Ollama from [ollama.com](https://ollama.com/)
+    - Run this command in your terminal: `ollama run llama3`
+    - No API key required
+    - Privacy-friendly (no data sent to external servers)
+    """)
+    
     if st.button("Clear Chat History"):
         st.session_state.chat_history = []
         st.success("Chat history cleared!")
-
-# Add the artistic pills illustration to the bottom left
-try:
-    # Read the SVG file and convert to base64
-    svg_path = os.path.join(os.path.dirname(__file__), "artistic_pills_illustration.svg")
-    if os.path.exists(svg_path):
-        with open(svg_path, "rb") as f:
-            svg_data = base64.b64encode(f.read()).decode("utf-8")
-            
-        st.markdown(
-            f"""
-            <style>
-            .pill-illustration {{
-                position: fixed;
-                bottom: 20px;
-                left: 20px;
-                width: 150px;
-                height: auto;
-                z-index: 1000;
-            }}
-            </style>
-            <div class="pill-illustration">
-                <img src="data:image/svg+xml;base64,{svg_data}" alt="Artistic Pills Illustration">
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-except Exception as e:
-    pass  # Silently ignore if illustration can't be loaded

@@ -1,16 +1,17 @@
 # PillQ – Pill Queries, Simplified
 
-PillQ is a Streamlit application designed to help you quickly retrieve and display drug label data from various FDA endpoints and DailyMed. It’s intended for formulary management, drug verification, and other clinical documentation tasks. By leveraging multiple sources (including openFDA, the FDA NDC directory, and DailyMed web scraping), PillQ aims to present consolidated medication information with minimal effort.
+PillQ is a Streamlit application designed to help you quickly retrieve and display drug label data from various FDA endpoints and DailyMed. It's intended for formulary management, drug verification, and other clinical documentation tasks. By leveraging multiple sources (including openFDA, the FDA NDC directory, and DailyMed web scraping), PillQ aims to present consolidated medication information with minimal effort.
 
 ## Table of Contents
 - [Overview](#overview)
-- [Key Features](#key-features)
+- [Features](#features)
 - [Dependencies](#dependencies)
 - [Installation](#installation)
 - [Usage](#usage)
 - [Data Flow and Architecture](#data-flow-and-architecture)
 - [DailyMed Web Scraper](#dailymed-web-scraper)
 - [Source Detection Logic](#source-detection-logic)
+- [AI Assistant](#ai-assistant)
 - [Limitations and Disclaimers](#limitations-and-disclaimers)
 - [License](#license)
 
@@ -21,54 +22,44 @@ PillQ provides both a single/multiple search interface (by NDC or drug name) and
 - The FDA NDC Directory endpoint for fallback NDC searches.
 - A DailyMed web scraper for label data and product images when openFDA results are missing or incomplete.
 
-The application is split into two main tabs:
+The application is split into three main tabs:
 1. **Single/Multiple Search:**
    - Enter NDCs or brand/generic names (comma-separated).
-   - Choose output format (JSON, CSV, Excel, TXT).
-   - Optionally show the data’s source (e.g., openFDA, DailyMed).
+   - Choose output format (CSV, JSON, Excel, TXT).
+   - Access the integrated AI Assistant for query help.
+   - Optionally show the data's source (e.g., openFDA, DailyMed).
 2. **File Upload:**
-   - Upload a CSV containing an “NDC” column.
+   - Upload a CSV containing an "NDC" column.
+   - Choose output format before configuration.
    - Select which data fields to retrieve.
    - Process the file to get a consolidated preview of the results, then download.
+3. **Settings:**
+   - Configure AI provider settings (OpenAI, DeepSeek, Ollama, Zephyr).
+   - Set API keys for your preferred AI providers.
 
-## Key Features
+## Features
 
-1. **NDC or Name:**
-   - Single or comma-separated entries.
-   - If searching by name, fallback logic fetches brand/generic info from openFDA.
-2. **Fallback:**
-   - If certain data fields (like `product_ndc`) are missing, the app tries the NDC Directory or DailyMed.
-3. **DailyMed Web Scraper:**
-   - If openFDA fails to provide certain label fields or images, the app can scrape the relevant page on DailyMed.
-4. **Source Info:**
-   - Each data field can note whether it was retrieved from openFDA, DailyMed, or both.
-   - Uses a custom `unify_source_string()` function to unify the final source strings.
-5. **Downloadable Results:**
-   - Output can be previewed in your chosen format and saved locally.
+1. **Single/Multiple Search**: Search for drug information by NDC code or name, with automatic detection of input type.
+2. **File Upload**: Upload files containing NDC codes and select which columns to keep and which OpenFDA fields to add.
+3. **AI Assistant**: Integrated chatbot that helps users answer questions about drugs using app functions.
+4. **Multiple AI Provider Support**: Supports multiple AI providers (Ollama, OpenAI, DeepSeek, Zephyr) with a dedicated settings tab for configuration.
+5. **Comprehensive Field Selection**: Access all available OpenFDA fields for searches.
+6. **Improved Image Retrieval**: Correctly displays product images for specific NDCs.
+7. **Enhanced Export Options**: Easily export data with configurable formats (CSV, JSON, Excel, TXT).
+8. **Accurate Ingredient Information**: Retrieves both active and inactive ingredients reliably from multiple sources.
 
 ## Dependencies
 
-This project uses the following core libraries:
+This project uses the following libraries:
 - `streamlit`: for the interactive web UI.
 - `requests`: to perform HTTP requests (openFDA, FDA NDC directory, DailyMed).
 - `pandas`: for data manipulation and DataFrame display.
-- `BeautifulSoup (bs4)`: for parsing HTML from DailyMed pages in the web scraper.
-- `urllib.parse`: to construct and encode query strings (e.g., for openFDA queries).
-- `io`: for handling in-memory file objects (Excel/CSV downloads).
-- `re`: for regex operations (used in scraping or cleaning text).
-- `difflib`: for fuzzy matching (if needed in your code).
-- `xslxwriter` (implied by Excel exports)
-- `helper_functions` (internal) which includes:
-  - `get_openfda_searchable_fields()`
-  - `get_product_image()`
-  - `get_product_ndc()`
-  - `get_label_field()`
-  - `get_combined_label_field()`
-  - `get_setid_from_search()`
-  - `fallback_ndc_search()`
-  - `unify_source_string()`
-
-Ensure these packages are installed in your environment. If you maintain a `requirements.txt`, verify it lists them.
+- `beautifulsoup4`: for parsing HTML from DailyMed pages in the web scraper.
+- `xlsxwriter`: for Excel file generation.
+- `Pillow`: for image processing.
+- `python-dotenv`: for environment variable management.
+- `jsonpickle`: for advanced JSON serialization.
+- `difflib`: for fuzzy matching in search operations.
 
 ## Installation
 
@@ -84,7 +75,13 @@ Ensure these packages are installed in your environment. If you maintain a `requ
    ```
 3. Install Dependencies:
    ```sh
-   pip install streamlit requests pandas beautifulsoup4 xlsxwriter
+   pip install -r requirements.txt
+   ```
+4. (Optional) Set up environment variables:
+   Create a `.env` file in the project root with your API keys:
+   ```
+   OPENFDA_API_KEY=your_api_key_here
+   OPENAI_API_KEY=your_openai_key_here
    ```
 
 ## Usage
@@ -93,57 +90,70 @@ Ensure these packages are installed in your environment. If you maintain a `requ
    ```sh
    streamlit run app.py
    ```
-   or:
-   ```sh
-   streamlit run your_app_file.py
-   ```
    If run locally, Streamlit will display a local URL in the terminal (e.g. `http://localhost:8501`).
-2. Navigate to the local URL in your browser. You’ll see two tabs:
+2. Navigate to the local URL in your browser. You'll see three tabs:
    - **Single/Multiple Search:**
-     1. Choose “NDC” or “Name.”
-     2. Type comma-separated entries.
-     3. Click **Preview Data**.
-     4. (Optional) Display source info, product images, or switch output formats.
+     1. Enter comma-separated NDCs or drug names.
+     2. Select OpenFDA fields to retrieve.
+     3. Click **Preview Results**.
+     4. View detailed information for selected NDCs.
+     5. Export data in your preferred format.
+     6. Optionally use the AI Assistant for drug-related questions.
    - **File Upload:**
-     1. Upload a CSV with an “NDC” column.
-     2. Pick the data fields you want (brand_name, generic_name, etc.).
-     3. Click **Process File**.
-     4. Download your results in CSV, Excel, TXT, or JSON.
-3. Check the console or Streamlit logs if you encounter errors or rate-limit warnings.
+     1. Upload a file containing NDC codes.
+     2. Choose your preferred output format (CSV by default).
+     3. Configure which columns to keep and which fields to retrieve.
+     4. Click **Process File**.
+     5. Download your enriched data.
+   - **Settings:**
+     1. Configure AI model providers.
+     2. Set API keys for selected providers.
+     3. Save preferences.
 
 ## Data Flow and Architecture
 
 1. **User Input:**
    - Single/Multiple Search: NDC or brand/generic name(s).
-   - File Upload: CSV with “NDC.”
+   - File Upload: CSV/JSON/Excel/TXT with "NDC".
 2. **Core Retrieval:**
-   - `search_ndc(ndc, labels, include_source)` queries openFDA or calls your fallback logic.
-   - `fetch_ndcs_for_name_drugsfda(name_str)` queries the `/drugsfda` endpoint to find brand/generic matches, fallback to the NDC directory if needed.
-   - DailyMed web scraper (in `get_label_field` or a separate function) is used if openFDA fails to return certain fields or if you explicitly prefer DailyMed data.
+   - `search_ndc(ndc, labels, include_source)` queries openFDA and DailyMed for comprehensive data.
+   - Specialized handling for active and inactive ingredients with fallback mechanisms.
+   - DailyMed web scraper used when openFDA data is incomplete.
 3. **Unifying Source:**
-   - `_source` fields are set to contain “openfda” or “dailymed.”
-   - The function `get_single_item_source(...)` checks these fields to produce “openFDA,” “DailyMed,” or “openFDA + DailyMed.”
+   - Results tracked with source information.
+   - Sources displayed based on user preference.
 4. **Output:**
-   - Results displayed in a table or JSON, with optional download in multiple formats.
+   - Results displayed in customizable formats with download options.
 
 ## DailyMed Web Scraper
 
-In some scenarios, openFDA data is incomplete. The app’s DailyMed scraper (referenced in `helper_functions.py`) will:
-1. Build the correct DailyMed URL (using `set_id` or an NDC search approach).
-2. Use `requests` to fetch the HTML.
-3. Parse the relevant table rows with BeautifulSoup.
-4. Extract fields like inactive ingredients, active moiety, or product images.
-5. Return them to the main app.
+The app's DailyMed scraper functions:
+1. Build DailyMed URLs based on NDC or set_id.
+2. Fetch and parse HTML content.
+3. Extract structured data including ingredients, dosages, and images.
+4. Provide high-quality data when openFDA results are incomplete.
 
 ## Source Detection Logic
 
-1. Each data field has a `_source` key set by `search_ndc(...)`.
-2. If a field is retrieved from openFDA, `_source` might contain “openfda.” If it’s from DailyMed scraping, `_source` might contain “dailymed.”
-3. The function `unify_source_string(...)` ensures that any raw string from your helper is converted to a consistent “openfda,” “dailymed,” or “openfda + dailymed.”
-4. Finally, `get_single_item_source(...)` inspects all fields to determine the final “(Source: X)” displayed in the UI.
+1. Each data field has a source attribution.
+2. Sources are consolidated for user display when requested.
+3. Consistent source formatting improves readability.
+
+## AI Assistant
+
+The integrated AI Assistant supports:
+1. Multiple AI providers:
+   - OpenAI (requires API key)
+   - DeepSeek (requires API key)
+   - Ollama (local, free - requires installation)
+   - Zephyr (via HuggingFace API)
+2. Context-aware drug information:
+   - Automatically retrieves relevant drug data for references in user questions
+   - Provides helpful information on pharmaceutical topics
 
 ## Limitations and Disclaimers
 
 - **Data Completeness:** Not all drug entries in openFDA or DailyMed are fully populated.
-- **Rate Limits:** openFDA imposes query limits.
-- **Not Medical Advice:** Always verify details with official FDA labeling.
+- **Rate Limits:** openFDA imposes query limits; consider obtaining an API key for production use.
+- **AI Assistant Accuracy:** The AI provides helpful information but should not be considered medical advice.
+- **Not Medical Advice:** Always verify details with official FDA labeling and consult healthcare professionals.

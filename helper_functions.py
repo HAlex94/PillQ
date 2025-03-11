@@ -6,6 +6,7 @@ import urllib.parse
 import difflib
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse, parse_qs
+import os
 
 def get_openfda_searchable_fields():
     """
@@ -280,6 +281,7 @@ def get_product_image(ndc):
     base_url = "https://api.fda.gov/drug/label.json"
     query = f'openfda.product_ndc.exact:"{product_ndc}"'
     params = {"search": query, "limit": 1}
+    print(f"Querying openFDA for NDC={ndc}, image")
     try:
         resp = requests.get(base_url, params=params, timeout=10)
         resp.raise_for_status()
@@ -349,7 +351,7 @@ def fallback_ndc_search(drug_name, limit=10):
                 # ...
     except Exception as e:
         print(f"fallback_ndc_search error: {e}")
-    return list(set(ndc_list))  # deduplicat
+    return list(set(ndc_list))  # deduplicate
 
 def unify_source_string(src):
     """
@@ -381,3 +383,378 @@ def unify_source_string(src):
         return "openfda + dailymed"
     else:
         return next(iter(used))  # either "openfda" or "dailymed"
+
+def fetch_ndcs_for_name_drugsfda(name_str, limit=50):
+    """
+    Query the OpenFDA drug API for products matching a brand or generic name.
+    Returns a list of dictionaries with NDC, brand name, generic name, dose form, etc.
+    
+    Args:
+        name_str (str): Brand or generic drug name to search for
+        limit (int): Maximum number of results to return
+        
+    Returns:
+        list: List of dictionaries with NDC info
+    """
+    results = []
+    
+    # Get API key from environment variable if available
+    api_key = os.environ.get('OPENFDA_API_KEY', '')
+    api_key_param = f"&api_key={api_key}" if api_key else ""
+    
+    # Encode the name for URL
+    encoded_name = urllib.parse.quote(name_str)
+    
+    # First try brand name search
+    brand_url = f"https://api.fda.gov/drug/ndc.json?search=brand_name:{encoded_name}&limit={limit}{api_key_param}"
+    
+    try:
+        brand_response = requests.get(brand_url)
+        brand_response.raise_for_status()
+        brand_data = brand_response.json()
+        
+        if "results" in brand_data:
+            for result in brand_data["results"]:
+                if "product_ndc" in result and "packaging" in result:
+                    for package in result["packaging"]:
+                        if "package_ndc" in package:
+                            # Extract and clean strength information
+                            strength = ""
+                            if "active_ingredients" in result and result["active_ingredients"]:
+                                # Check if this is a multi-ingredient product
+                                if len(result["active_ingredients"]) > 1:
+                                    # For multi-ingredient products like Adderall, calculate the total strength
+                                    total_strength = 0
+                                    strength_unit = ""
+                                    
+                                    # Sum up the strength values from all ingredients
+                                    for ing in result["active_ingredients"]:
+                                        strength_str = ing.get("strength", "")
+                                        # Get the numeric part of the strength
+                                        if " mg" in strength_str:
+                                            try:
+                                                # Extract number and unit
+                                                num_str = strength_str.split(" mg")[0].replace("/1", "")
+                                                total_strength += float(num_str)
+                                                strength_unit = " mg"
+                                            except:
+                                                pass
+                                        elif " mcg" in strength_str:
+                                            try:
+                                                num_str = strength_str.split(" mcg")[0].replace("/1", "")
+                                                total_strength += float(num_str)
+                                                strength_unit = " mcg"
+                                            except:
+                                                pass
+                                    
+                                    # Format the total strength
+                                    if total_strength > 0:
+                                        if total_strength.is_integer():
+                                            strength = f"{int(total_strength)}{strength_unit}"
+                                        else:
+                                            strength = f"{total_strength}{strength_unit}"
+                                    else:
+                                        # Fallback to listing all strengths
+                                        strength = ", ".join([ing.get("strength", "").replace("/1", "") for ing in result["active_ingredients"]])
+                                else:
+                                    # Single ingredient case - use the first ingredient's strength
+                                    try:
+                                        strength_str = result["active_ingredients"][0].get("strength", "")
+                                        # Remove "/1" if present
+                                        strength_str = strength_str.replace("/1", "")
+                                        # Try to convert to integer if it's a whole number
+                                        if " mg" in strength_str:
+                                            strength_num = strength_str.split(" mg")[0]
+                                            try:
+                                                if float(strength_num).is_integer():
+                                                    strength_str = f"{int(float(strength_num))} mg"
+                                                else:
+                                                    strength_str = f"{float(strength_num)} mg"
+                                            except:
+                                                pass
+                                        strength = strength_str
+                                    except:
+                                        strength = ", ".join([ing.get("strength", "").replace("/1", "") for ing in result.get("active_ingredients", [])])
+                            
+                            # Clean up package description - remove any NDC references more thoroughly
+                            package_desc = package.get("description", "")
+                            
+                            # Remove pattern like " (NDC)" or " (NDC: 12345-678-90)" or "(57844-110-01)" at the end
+                            import re
+                            # First pattern: remove " (NDC)" or similar simple patterns
+                            package_desc = re.sub(r'\s*\(\s*NDC\s*\)', '', package_desc, flags=re.IGNORECASE)
+                            
+                            # Second pattern: remove NDC with the actual number in parentheses
+                            package_desc = re.sub(r'\s*\(\s*NDC\s*:?\s*[\d\-]+\s*\)', '', package_desc, flags=re.IGNORECASE)
+                            
+                            # Third pattern: just a number in parentheses at the end that looks like an NDC
+                            package_desc = re.sub(r'\s*\(\s*[\d\-]+\s*\)\s*$', '', package_desc)
+                            
+                            # Extract the relevant information
+                            ndc_info = {
+                                "NDC": package.get("package_ndc", ""),
+                                "brand_name": result.get("brand_name", ""),
+                                "generic_name": result.get("generic_name", ""),
+                                "strength": strength,
+                                "route": result.get("route", ""),
+                                "dosage_form": result.get("dosage_form", ""),
+                                "manufacturer": result.get("labeler_name", ""),
+                                "package_description": package_desc.strip()
+                            }
+                            results.append(ndc_info)
+    except Exception as e:
+        print(f"Error fetching brand name data: {e}")
+    
+    # If no results from brand name, try generic name search
+    if not results:
+        generic_url = f"https://api.fda.gov/drug/ndc.json?search=generic_name:{encoded_name}&limit={limit}{api_key_param}"
+        
+        try:
+            generic_response = requests.get(generic_url)
+            generic_response.raise_for_status()
+            generic_data = generic_response.json()
+            
+            if "results" in generic_data:
+                for result in generic_data["results"]:
+                    if "product_ndc" in result and "packaging" in result:
+                        for package in result["packaging"]:
+                            if "package_ndc" in package:
+                                # Extract and clean strength information
+                                strength = ""
+                                if "active_ingredients" in result and result["active_ingredients"]:
+                                    # Check if this is a multi-ingredient product
+                                    if len(result["active_ingredients"]) > 1:
+                                        # For multi-ingredient products like Adderall, calculate the total strength
+                                        total_strength = 0
+                                        strength_unit = ""
+                                        
+                                        # Sum up the strength values from all ingredients
+                                        for ing in result["active_ingredients"]:
+                                            strength_str = ing.get("strength", "")
+                                            # Get the numeric part of the strength
+                                            if " mg" in strength_str:
+                                                try:
+                                                    # Extract number and unit
+                                                    num_str = strength_str.split(" mg")[0].replace("/1", "")
+                                                    total_strength += float(num_str)
+                                                    strength_unit = " mg"
+                                                except:
+                                                    pass
+                                            elif " mcg" in strength_str:
+                                                try:
+                                                    num_str = strength_str.split(" mcg")[0].replace("/1", "")
+                                                    total_strength += float(num_str)
+                                                    strength_unit = " mcg"
+                                                except:
+                                                    pass
+                                        
+                                        # Format the total strength
+                                        if total_strength > 0:
+                                            if total_strength.is_integer():
+                                                strength = f"{int(total_strength)}{strength_unit}"
+                                            else:
+                                                strength = f"{total_strength}{strength_unit}"
+                                        else:
+                                            # Fallback to listing all strengths
+                                            strength = ", ".join([ing.get("strength", "").replace("/1", "") for ing in result["active_ingredients"]])
+                                    else:
+                                        # Single ingredient case - use the first ingredient's strength
+                                        try:
+                                            strength_str = result["active_ingredients"][0].get("strength", "")
+                                            # Remove "/1" if present
+                                            strength_str = strength_str.replace("/1", "")
+                                            # Try to convert to integer if it's a whole number
+                                            if " mg" in strength_str:
+                                                strength_num = strength_str.split(" mg")[0]
+                                                try:
+                                                    if float(strength_num).is_integer():
+                                                        strength_str = f"{int(float(strength_num))} mg"
+                                                    else:
+                                                        strength_str = f"{float(strength_num)} mg"
+                                                except:
+                                                    pass
+                                            strength = strength_str
+                                        except:
+                                            strength = ", ".join([ing.get("strength", "").replace("/1", "") for ing in result.get("active_ingredients", [])])
+                                
+                                # Clean up package description - remove any NDC references more thoroughly
+                                package_desc = package.get("description", "")
+                                
+                                # Remove pattern like " (NDC)" or " (NDC: 12345-678-90)" or "(57844-110-01)" at the end
+                                import re
+                                # First pattern: remove " (NDC)" or similar simple patterns
+                                package_desc = re.sub(r'\s*\(\s*NDC\s*\)', '', package_desc, flags=re.IGNORECASE)
+                                
+                                # Second pattern: remove NDC with the actual number in parentheses
+                                package_desc = re.sub(r'\s*\(\s*NDC\s*:?\s*[\d\-]+\s*\)', '', package_desc, flags=re.IGNORECASE)
+                                
+                                # Third pattern: just a number in parentheses at the end that looks like an NDC
+                                package_desc = re.sub(r'\s*\(\s*[\d\-]+\s*\)\s*$', '', package_desc)
+                                
+                                # Extract the relevant information
+                                ndc_info = {
+                                    "NDC": package.get("package_ndc", ""),
+                                    "brand_name": result.get("brand_name", ""),
+                                    "generic_name": result.get("generic_name", ""),
+                                    "strength": strength,
+                                    "route": result.get("route", ""),
+                                    "dosage_form": result.get("dosage_form", ""),
+                                    "manufacturer": result.get("labeler_name", ""),
+                                    "package_description": package_desc.strip()
+                                }
+                                results.append(ndc_info)
+        except Exception as e:
+            print(f"Error fetching generic name data: {e}")
+    
+    return results
+
+def search_ndc(ndc, labels_to_get, include_source=True):
+    """
+    Search for NDC and return data for specified label fields.
+    
+    Args:
+        ndc (str): The NDC code to search for
+        labels_to_get (list): List of label fields to retrieve
+        include_source (bool): Whether to include the source of each field
+        
+    Returns:
+        dict: Dictionary with the requested fields and their values
+    """
+    result = {}
+    
+    # Get API key from environment variable if available
+    api_key = os.environ.get('OPENFDA_API_KEY', '')
+    api_key_param = f"&api_key={api_key}" if api_key else ""
+    
+    # Create a product-level NDC for OpenFDA queries
+    product_ndc = get_product_ndc(ndc)
+    
+    # Special handling for active_ingredient and inactive_ingredient using the old method
+    special_fields = ["active_ingredient", "inactive_ingredient", "indications_and_usage", "warnings", "description"]
+    regular_fields = [field for field in labels_to_get if field not in special_fields]
+    
+    # Process special fields using the established methods
+    for field in special_fields:
+        if field in labels_to_get:
+            try:
+                if field == "active_ingredient":
+                    data, source = get_label_field(ndc, field, ["Active Ingredient", "Active Ingredients", "Ingredients"])
+                elif field == "inactive_ingredient":
+                    data, source = get_label_field(ndc, field, ["Inactive Ingredient", "Inactive Ingredients"])
+                elif field == "indications_and_usage":
+                    data, source = get_label_field(ndc, field, ["Indications", "Uses", "Indications and Usage"])
+                elif field == "warnings":
+                    data, source = get_label_field(ndc, field, ["Warning", "Warnings"])
+                elif field == "description":
+                    data, source = get_label_field(ndc, field, ["Description"])
+                
+                result[field] = data
+                if include_source:
+                    result[f"{field}_source"] = source
+            except Exception as e:
+                print(f"Error retrieving special field {field}: {e}")
+                result[field] = "Not available"
+                if include_source:
+                    result[f"{field}_source"] = "Error"
+    
+    # Process regular fields using the new method for efficiency
+    if regular_fields:
+        # Try OpenFDA first for the regular fields
+        openfda_url = f"https://api.fda.gov/drug/ndc.json?search=package_ndc:{ndc}{api_key_param}"
+        
+        try:
+            response = requests.get(openfda_url)
+            response.raise_for_status()
+            data = response.json()
+            
+            if "results" in data and len(data["results"]) > 0:
+                product = data["results"][0]
+                
+                # Add all requested regular fields that are available in the OpenFDA response
+                for label in regular_fields:
+                    if label in product:
+                        result[label] = product[label]
+                        if include_source:
+                            result[f"{label}_source"] = "OpenFDA"
+                    elif label.startswith("openfda.") and "openfda" in product:
+                        # Handle nested openfda fields
+                        nested_field = label.split(".", 1)[1]
+                        if nested_field in product["openfda"]:
+                            result[label] = product["openfda"][nested_field]
+                            if include_source:
+                                result[f"{label}_source"] = "OpenFDA"
+        except Exception as e:
+            print(f"Error in OpenFDA lookup: {e}")
+        
+        # Try DailyMed for any missing regular fields
+        dailymed_url = f"https://dailymed.nlm.nih.gov/dailymed/services/v2/ndc/{ndc}.json"
+        
+        try:
+            response = requests.get(dailymed_url)
+            response.raise_for_status()
+            dailymed_data = response.json()
+            
+            # Process the DailyMed response to extract the requested fields
+            for label in regular_fields:
+                if label not in result and label in dailymed_data:
+                    result[label] = dailymed_data[label]
+                    if include_source:
+                        result[f"{label}_source"] = "DailyMed"
+        except Exception as e:
+            print(f"Error in DailyMed lookup: {e}")
+    
+    # For any requested fields that were not found in either source
+    for label in labels_to_get:
+        if label not in result:
+            result[label] = "Not available"
+            if include_source:
+                result[f"{label}_source"] = "Error"
+    
+    return result
+
+def get_single_item_source(item_dict, field_name):
+    """
+    Get the source of a single field from a drug data dictionary.
+    
+    Args:
+        item_dict (dict): The dictionary containing drug data
+        field_name (str): The name of the field to get the source for
+        
+    Returns:
+        str: The source of the field ("OpenFDA", "DailyMed", or "Multiple Sources")
+    """
+    source_key = f"{field_name}_source"
+    
+    if source_key not in item_dict:
+        return "Unknown"
+    
+    source = item_dict[source_key]
+    
+    # Check for OpenFDA source
+    if "openfda" in source.lower():
+        return "OpenFDA"
+    # Check for DailyMed source
+    elif "dailymed" in source.lower():
+        return "DailyMed"
+    # Handle multiple sources
+    elif "openfda + dailymed" in source.lower():
+        return "Multiple Sources"
+    else:
+        return source
+
+def search_name_placeholder(name_str, limit=50):
+    """
+    A simple placeholder function for drug name searches that returns no data.
+    This function is a compatibility wrapper used when the actual search functionality
+    is not available or is being migrated to a new implementation.
+    
+    Args:
+        name_str (str): The drug name to search for (unused)
+        limit (int): Maximum number of results to return (unused)
+        
+    Returns:
+        list: Empty list
+    """
+    # This is just a placeholder function to satisfy imports
+    # Actual implementation should now use fetch_ndcs_for_name_drugsfda
+    return []
