@@ -14,7 +14,8 @@ from helper_functions import (
     get_combined_label_field,
     get_setid_from_search,
     fallback_ndc_search,
-    unify_source_string
+    unify_source_string,
+    convert_df
 )
 
 # ------------------------------------------------------------------
@@ -199,142 +200,456 @@ def get_single_item_source(data_dict, labels, include_source):
     for lbl in labels:
         src_key = lbl + "_source"
         if src_key in data_dict:
-            val = data_dict[src_key].lower()
-            if "openfda" in val:
+            src = data_dict[src_key].lower()
+            if "openfda" in src:
                 sources_used.add("openFDA")
-            if "dailymed" in val:
+            if "dailymed" in src:
                 sources_used.add("DailyMed")
-    if not sources_used:
+    if len(sources_used) == 0:
         return "None"
     elif len(sources_used) == 1:
         return next(iter(sources_used))
     else:
         return "openFDA + DailyMed"
 
-def convert_df(df, fmt):
-    if fmt == "CSV":
-        return df.to_csv(index=False).encode("utf-8")
-    elif fmt == "Excel":
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-            df.to_excel(writer, index=False, sheet_name="Sheet1")
-        return output.getvalue()
-    elif fmt == "TXT":
-        return df.to_csv(sep="\t", index=False).encode("utf-8")
-    elif fmt == "JSON":
-        return df.to_json(orient="records").encode("utf-8")
-
 # ------------------------------------------------------------------
 # Layout with two tabs
 # ------------------------------------------------------------------
 tab1, tab2 = st.tabs(["Single/Multiple Search", "File Upload"])
 
-# ==================== TAB 1: Single/Multiple Search ====================
 with tab1:
     col_left, col_right = st.columns([1, 2])
 
     with col_left:
         st.subheader("Single/Multiple Search")
-        search_mode = st.radio("Search By:", ["NDC", "Name"], horizontal=True)
-        multi_input = st.text_input("Enter comma-separated items (NDC or Name)")
-        output_format = st.radio("Output Format", ["JSON", "CSV", "Excel", "TXT"], horizontal=True)
-        include_source = st.checkbox("Include Source Info in Output", value=False)
-        show_header_source = st.checkbox("Show Source in Single Item Header", value=True)
-
-        # Retrieve openFDA fields & ensure brand/generic
-        openfda_fields = sorted(list(get_openfda_searchable_fields()))
-        if not openfda_fields:
-            openfda_fields = ["active_ingredient", "inactive_ingredient", "indications_and_usage"]
-        for needed in ["brand_name", "generic_name"]:
-            if needed not in openfda_fields:
-                openfda_fields.append(needed)
-        openfda_fields = sorted(openfda_fields)
-
-        selected_labels = st.multiselect(
-            "Select Data Fields to Retrieve",
-            options=openfda_fields,
-            default=["brand_name", "generic_name"]
+        
+        # Initialize session state variables if they don't exist
+        if 'multi_input' not in st.session_state:
+            st.session_state.multi_input = ""
+        if 'search_performed' not in st.session_state:
+            st.session_state.search_performed = False
+        if 'search_results' not in st.session_state:
+            st.session_state.search_results = []
+        if 'selected_ndcs' not in st.session_state:
+            st.session_state.selected_ndcs = []
+        
+        # Function to update search state
+        def update_search():
+            st.session_state.multi_input = multi_input
+            st.session_state.search_performed = True
+            # Reset the selected NDCs and search results when starting a new search
+            st.session_state.selected_ndcs = []
+            st.session_state.search_results = []
+        
+        # Text input for NDC or drug name
+        multi_input = st.text_area(
+            "Enter values (comma-separated)",
+            value=st.session_state.multi_input,
+            placeholder="Example NDC: 12345-6789-0\nExample Name: Aspirin",
+            height=150
         )
-        preview_btn = st.button("Preview Data")
+        
+        try:
+            available_fields = get_openfda_searchable_fields()
+            default_fields = ["active_ingredient", "inactive_ingredient", "indications_and_usage", "dosage_form"]
+            
+            field_options = []
+            for field in default_fields:
+                if field in available_fields:
+                    field_options.append(field)
+                    
+            for field in sorted(available_fields):
+                if field not in default_fields:
+                    field_options.append(field)
+        except Exception as e:
+            st.warning(f"Could not fetch all OpenFDA fields: {e}")
+            field_options = ["active_ingredient", "inactive_ingredient", "indications_and_usage", 
+                           "dosage_form", "warnings", "description", "contraindications"]
+        
+        labels_to_get = st.multiselect(
+            "Select fields to retrieve",
+            options=field_options,
+            default=["active_ingredient", "inactive_ingredient"],
+            key="fields_single_search"
+        )
+        
+        include_sources = st.checkbox("Include data sources", value=True, key="sources_single_search")
+        
+        # Store the preview button state and handle clicks
+        preview_btn = st.button("Preview Results", on_click=update_search)
+        
+        export_format = st.radio(
+            "Output Format",
+            ["JSON", "CSV", "Excel", "TXT"],
+            horizontal=True,
+            key="format_single_search"
+        )
 
     with col_right:
-        if preview_btn and multi_input.strip():
-            items = [x.strip() for x in multi_input.split(",") if x.strip()]
-
-            # -------------------------------------------------
-            # Single Item
-            # -------------------------------------------------
-            if len(items) == 1:
-                single_item = items[0]
-                if search_mode == "Name":
-                    # Name-based search for a single brand/generic
-                    ndc_matches = fetch_ndcs_for_name_drugsfda(single_item, limit=50)
-                    if ndc_matches:
-                        st.write("### Found Matching NDCs:")
-                        df_matches = pd.DataFrame(ndc_matches)
-                        st.dataframe(df_matches)
+        # Process search if button was clicked or if we have previous search results
+        if (preview_btn or st.session_state.search_performed) and st.session_state.multi_input.strip():
+            items = [x.strip() for x in st.session_state.multi_input.split(",") if x.strip()]
+            
+            all_results = []
+            with st.spinner(f"Processing {len(items)} items..."):
+                for item in items:
+                    if item.replace('-', '').isdigit():
+                        result = search_ndc(item, labels_to_get, include_sources)
+                        all_results.append(result)  
+                        
+                        img_url = get_product_image(item)
+                        if img_url:
+                            st.image(img_url, caption="Product Label", width=400)
+                        else:
+                            st.info("No product image available for this NDC.")
                     else:
-                        st.warning(f"No matching products found in drugsfda for '{single_item}' by Name search.")
-                else:
-                    # Single NDC scenario
-                    single_data = search_ndc(single_item, selected_labels, include_source=include_source)
-                    final_source = get_single_item_source(single_data, selected_labels, include_source) if show_header_source else "None"
+                        # For name search, store results in session state
+                        if not preview_btn and st.session_state.search_results:
+                            # Use cached results if not clicking the button again
+                            name_results = st.session_state.search_results
+                        else:
+                            # Perform new search and update session state
+                            name_results = fetch_ndcs_for_name_drugsfda(item)
+                            st.session_state.search_results = name_results
+                        
+                        if name_results:
+                            # Create container for search results
+                            st.markdown("### Search Results")
+                            
+                            # Create DataFrame from search results
+                            df_display = pd.DataFrame(name_results)
+                            
+                            # Calculate dynamic height based on number of rows, capped at ~8 rows
+                            num_rows = len(df_display)
+                            # Base height per row (~40px) + header (~45px) + some padding
+                            dynamic_height = min(max(num_rows * 40 + 45, 100), 375)  # Min height 100px, max ~8 rows (375px)
+                            
+                            # Display the table with static data
+                            st.dataframe(df_display, height=dynamic_height, use_container_width=True)
 
-                    # Fallback if the detection logic yields "None"
-                    if final_source == "None":
-                        final_source = "openFDA"
+                            # Add an export button for the complete table
+                            st.markdown("### Export Search Results Table")
+                            export_table = df_display.copy()
+                            
+                            # Add option to include search field data in export
+                            include_field_data = st.checkbox("Include data from selected search fields", value=True, key="include_fields_export")
+                            
+                            # If user wants to include field data, fetch and add it to the export table
+                            if include_field_data and labels_to_get:
+                                # Create a progress bar for field data fetching
+                                fetch_progress = st.progress(0)
+                                st.write("Fetching field data for each NDC...")
+                                
+                                # Create columns for each selected field
+                                for field in labels_to_get:
+                                    export_table[field] = None
+                                
+                                # Fetch detailed data for each NDC and add the fields
+                                for i, row in export_table.iterrows():
+                                    ndc = row['NDC']
+                                    # Update progress bar
+                                    fetch_progress.progress((i + 1) / len(export_table))
+                                    
+                                    try:
+                                        # Get detailed data for this NDC
+                                        detailed_data = search_ndc(ndc, labels_to_get, include_source=False)
+                                        
+                                        # Add each selected field to the export table
+                                        for field in labels_to_get:
+                                            if field in detailed_data:
+                                                export_table.at[i, field] = detailed_data[field]
+                                    except Exception as e:
+                                        st.warning(f"Could not fetch detailed data for NDC {ndc}: {e}")
+                                
+                                # Complete the progress
+                                fetch_progress.progress(1.0)
+                                st.success("Field data fetched successfully!")
+                            
+                            # If user selects export, provide download in selected format
+                            if st.button("Export Table Results"):
+                                if export_format == "CSV":
+                                    csv = convert_df(export_table, "CSV")
+                                    st.download_button(
+                                        label="Download CSV",
+                                        data=csv,
+                                        file_name="search_results.csv",
+                                        mime="text/csv"
+                                    )
+                                elif export_format == "Excel":
+                                    excel = convert_df(export_table, "Excel")
+                                    st.download_button(
+                                        label="Download Excel",
+                                        data=excel,
+                                        file_name="search_results.xlsx",
+                                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                                    )
+                                elif export_format == "TXT":
+                                    txt = convert_df(export_table, "TXT")
+                                    st.download_button(
+                                        label="Download TXT",
+                                        data=txt,
+                                        file_name="search_results.txt",
+                                        mime="text/plain"
+                                    )
+                                else:  # JSON
+                                    json_str = convert_df(export_table, "JSON")
+                                    st.download_button(
+                                        label="Download JSON",
+                                        data=json_str,
+                                        file_name="search_results.json",
+                                        mime="application/json"
+                                    )
+                            
+                            # Create a list of NDC options for the multiselect
+                            ndc_options = [ndc_item['NDC'] for ndc_item in name_results]
+                            
+                            # Create a multiselect for the NDCs - use empty list when options change
+                            st.markdown("### Select NDC(s) to preview")
+                            
+                            # Only use existing selections if they're still valid options
+                            valid_defaults = [ndc for ndc in st.session_state.selected_ndcs if ndc in ndc_options]
+                            
+                            selected_ndcs = st.multiselect(
+                                "Choose one or more NDCs to view details",
+                                options=ndc_options,
+                                default=valid_defaults,
+                                key="ndc_multiselect"
+                            )
+                            
+                            # Update the session state
+                            st.session_state.selected_ndcs = selected_ndcs
+                            
+                            # Display detailed information for selected NDCs
+                            if selected_ndcs:
+                                st.markdown("### Detailed Information for Selected NDC(s)")
+                                
+                                # Create tabs for each selected NDC
+                                ndc_tabs = st.tabs(selected_ndcs)
+                                
+                                # For each tab, display the detailed information for that NDC
+                                for i, ndc in enumerate(selected_ndcs):
+                                    with ndc_tabs[i]:
+                                        # Get all fields for the NDC
+                                        detailed_data = search_ndc(ndc, labels_to_get, include_sources)
+                                        
+                                        # Display the data in the selected format
+                                        if export_format == "JSON":
+                                            st.json(detailed_data)
+                                        elif export_format == "CSV":
+                                            df_detailed = pd.DataFrame([detailed_data])
+                                            st.dataframe(df_detailed)
+                                            csv = convert_df(df_detailed, "CSV")
+                                            st.download_button(
+                                                label="Download CSV",
+                                                data=csv,
+                                                file_name=f"{ndc}_details.csv",
+                                                mime="text/csv"
+                                            )
+                                        elif export_format == "Excel":
+                                            df_detailed = pd.DataFrame([detailed_data])
+                                            st.dataframe(df_detailed)
+                                            excel = convert_df(df_detailed, "Excel")
+                                            st.download_button(
+                                                label="Download Excel",
+                                                data=excel,
+                                                file_name=f"{ndc}_details.xlsx",
+                                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                                            )
+                                        elif export_format == "TXT":
+                                            df_detailed = pd.DataFrame([detailed_data])
+                                            st.dataframe(df_detailed)
+                                            txt = convert_df(df_detailed, "TXT")
+                                            st.download_button(
+                                                label="Download TXT",
+                                                data=txt,
+                                                file_name=f"{ndc}_details.txt",
+                                                mime="text/plain"
+                                            )
+            
+            # Export all combined results if not name search
+            if all_results and len(all_results) == len(items) and all(isinstance(item, dict) for item in all_results):
+                df_combined = pd.DataFrame(all_results)
+                combined_data = convert_df(df_combined, export_format)
+                
+                st.download_button(
+                    label=f"Download {export_format}",
+                    data=combined_data,
+                    file_name=f"ndc_search_results.{export_format.lower()}",
+                    mime="text/csv" if export_format == "CSV" else "application/octet-stream"
+                )
 
-                    if show_header_source:
-                        st.markdown(
-                            f"<h3>Processing Single NDC <span style='font-size:14px;'>(Source: {final_source})</span></h3>",
-                            unsafe_allow_html=True
-                        )
-                    else:
-                        st.markdown("<h3>Processing Single NDC</h3>", unsafe_allow_html=True)
+                # For NDC searches, add export functionality
+                if all_results and len(all_results) == 1:
+                    st.markdown("### Export Search Result")
+                    if st.button("Export NDC Details"):
+                        result_df = pd.DataFrame([all_results[0]])
+                        if export_format == "JSON":
+                            json_str = convert_df(result_df, "JSON")
+                            st.download_button(
+                                label="Download JSON",
+                                data=json_str,
+                                file_name="ndc_details.json",
+                                mime="application/json"
+                            )
+                        elif export_format == "CSV":
+                            csv = convert_df(result_df, "CSV")
+                            st.download_button(
+                                label="Download CSV",
+                                data=csv,
+                                file_name="ndc_details.csv",
+                                mime="text/csv"
+                            )
+                        elif export_format == "Excel":
+                            excel = convert_df(result_df, "Excel")
+                            st.download_button(
+                                label="Download Excel",
+                                data=excel,
+                                file_name="ndc_details.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                            )
+                        elif export_format == "TXT":
+                            txt = convert_df(result_df, "TXT")
+                            st.download_button(
+                                label="Download TXT",
+                                data=txt,
+                                file_name="ndc_details.txt",
+                                mime="text/plain"
+                            )
 
-                    # Optionally display product image
-                    img_url = get_product_image(single_item)
-                    if img_url:
-                        st.image(img_url, caption="Product Label", width=400)
-                    else:
-                        st.info("No product image available for this NDC.")
-
-                    # Display single_data in chosen format
-                    if output_format == "JSON":
-                        st.json(single_data)
-                    elif output_format in ["CSV", "Excel"]:
-                        st.dataframe(pd.DataFrame([single_data]))
-                    elif output_format == "TXT":
-                        st.text(pd.DataFrame([single_data]).to_csv(sep="\t", index=False))
-
-            # -------------------------------------------------
-            # Multiple Items
-            # -------------------------------------------------
+    # AI Assistant Section - Only show when requested
+    st.markdown("---")
+    show_assistant = st.checkbox("Show AI Assistant", value=False, key="show_assistant")
+    if show_assistant:
+        # Integrate AI chatbot here
+        st.markdown("### PillQ AI Assistant")
+        st.markdown("Ask me anything about drug information and I'll help you find answers.")
+        
+        user_question = st.text_area("Your question:", key="ai_question", height=100)
+        
+        if st.button("Ask AI Assistant"):
+            if user_question:
+                # Placeholder for AI response
+                with st.spinner("Thinking..."):
+                    # Replace with actual AI integration
+                    time.sleep(2)
+                    st.markdown(f"""
+                    **Answer:** 
+                    
+                    I see you're asking about: "{user_question}"
+                    
+                    This is a placeholder for the AI assistant's response. 
+                    In the real implementation, this would call the AI model.
+                    """)
             else:
-                df_result = pd.DataFrame()
-                for itm in items:
-                    if search_mode == "Name":
-                        # Minimal approach if user typed multiple brand/generic names
-                        df_result = df_result.append({"Name": itm, "Note": "Placeholder multiple name logic."}, ignore_index=True)
-                    else:
-                        row_data = search_ndc(itm, selected_labels, include_source=include_source)
-                        df_result = df_result.append(row_data, ignore_index=True)
-                if not df_result.empty:
-                    if output_format == "JSON":
-                        st.json(df_result.to_dict(orient="records"))
-                    elif output_format in ["CSV", "Excel"]:
-                        st.dataframe(df_result)
-                    elif output_format == "TXT":
-                        st.text(df_result.to_csv(sep="\t", index=False))
-                    conv_data = convert_df(df_result, output_format)
-                    st.download_button(
-                        label="Download Output",
-                        data=conv_data,
-                        file_name=f"pillq_output.{output_format.lower()}",
-                        mime="text/csv" if output_format=="CSV" else
-                             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" if output_format=="Excel" else
-                             "text/plain" if output_format=="TXT" else
-                             "application/json"
-                    )
-        else:
-            st.info("Enter comma-separated items and click 'Preview Data'.")
+                st.warning("Please enter a question first.")
+
+with tab2:
+    st.subheader("File Upload")
+    
+    uploaded_file = st.file_uploader("Upload a file containing NDC codes:", type=['csv', 'xlsx', 'txt', 'json'])
+    
+    if uploaded_file is not None:
+        # Determine file type from extension
+        file_ext = uploaded_file.name.split('.')[-1].lower()
+        
+        try:
+            if file_ext == 'csv':
+                df = pd.read_csv(uploaded_file)
+            elif file_ext == 'xlsx':
+                df = pd.read_excel(uploaded_file)
+            elif file_ext == 'txt':
+                # Try to determine delimiter
+                df = pd.read_csv(uploaded_file, sep=None, engine='python')
+            elif file_ext == 'json':
+                df = pd.read_json(uploaded_file)
+            
+            st.success(f"File uploaded successfully! Found {len(df)} rows.")
+            
+            # Show the first 5 rows
+            st.write("Preview of your data:")
+            st.dataframe(df.head())
+            
+            # Let user select columns that contain NDC codes
+            st.markdown("### Select columns containing NDC codes")
+            ndc_columns = st.multiselect(
+                "Choose columns containing NDC codes:",
+                options=df.columns.tolist()
+            )
+            
+            if ndc_columns:
+                # Let user select which columns to keep
+                st.markdown("### Select columns to keep")
+                keep_columns = st.multiselect(
+                    "Choose columns to keep in output:",
+                    options=df.columns.tolist(),
+                    default=ndc_columns
+                )
+                
+                # Select OpenFDA fields to add
+                st.markdown("### Select OpenFDA fields to add")
+                openfda_fields = st.multiselect(
+                    "Choose OpenFDA fields to add:",
+                    options=field_options,
+                    default=["active_ingredient", "inactive_ingredient"]
+                )
+                
+                include_sources_upload = st.checkbox("Include data sources", value=True)
+                
+                if st.button("Process File"):
+                    with st.spinner("Processing your file..."):
+                        # Create a new dataframe with selected columns
+                        output_df = df[keep_columns].copy()
+                        
+                        # Process NDC columns
+                        for col in ndc_columns:
+                            # Create progress bar
+                            total_rows = len(df)
+                            progress_bar = st.progress(0)
+                            
+                            for i, ndc in enumerate(df[col]):
+                                # Update progress
+                                progress_bar.progress((i + 1) / total_rows)
+                                
+                                # Skip empty/NA values
+                                if pd.isna(ndc) or ndc == "":
+                                    continue
+                                
+                                # Clean the NDC string
+                                ndc_str = str(ndc).strip()
+                                
+                                # Get data for this NDC
+                                try:
+                                    ndc_data = search_ndc(ndc_str, openfda_fields, include_sources_upload)
+                                    
+                                    # Add each field as a new column
+                                    for field in openfda_fields:
+                                        field_col_name = f"{col}_{field}"
+                                        output_df.at[i, field_col_name] = ndc_data.get(field, "Not Available")
+                                        
+                                        if include_sources_upload and field + "_source" in ndc_data:
+                                            source_col_name = f"{col}_{field}_source"
+                                            output_df.at[i, source_col_name] = ndc_data[field + "_source"]
+                                except Exception as e:
+                                    st.warning(f"Error processing NDC {ndc_str}: {e}")
+                        
+                        # Display the output
+                        st.success("Processing complete!")
+                        st.write("Output:")
+                        st.dataframe(output_df)
+                        
+                        # Allow downloading the result
+                        output_format = st.radio(
+                            "Output Format",
+                            ["CSV", "Excel", "JSON", "TXT"],
+                            horizontal=True
+                        )
+                        
+                        output_data = convert_df(output_df, output_format)
+                        st.download_button(
+                            label=f"Download {output_format}",
+                            data=output_data,
+                            file_name=f"processed_ndc_data.{output_format.lower()}",
+                            mime="text/csv" if output_format == "CSV" else "application/octet-stream"
+                        )
+        except Exception as e:
+            st.error(f"Error processing uploaded file: {e}")
