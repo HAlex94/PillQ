@@ -226,6 +226,11 @@ with tab1:
                                                 detailed_df_transposed = detailed_df.T.reset_index()
                                                 detailed_df_transposed.columns = ["Field", "Value"]
                                                 
+                                                # Handle list values to ensure proper display
+                                                detailed_df_transposed["Value"] = detailed_df_transposed["Value"].apply(
+                                                    lambda x: str(x) if isinstance(x, list) else x
+                                                )
+                                                
                                                 # Add a Source column if include_sources is True
                                                 if include_sources:
                                                     # Create a new column for Source
