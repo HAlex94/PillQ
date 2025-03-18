@@ -20,7 +20,9 @@ from helper_functions import (
     search_ndc,
     search_name_placeholder,
     get_single_item_source,
-    convert_df
+    convert_df,
+    clean_html_table,
+    is_safe_table
 )
 
 # ------------------------------------------------------------------
@@ -231,6 +233,13 @@ with tab1:
                                                     lambda x: str(x) if isinstance(x, list) else x
                                                 )
                                                 
+                                                # Create a copy of the data for display purposes
+                                                display_df = detailed_df_transposed.copy()
+                                                
+                                                # Check for HTML table fields that should be rendered
+                                                html_table_fields = ["dosage_and_administration_table", "clinical_studies_table", 
+                                                                    "indications_usage_table", "warnings_table"]
+                                                
                                                 # Add a Source column if include_sources is True
                                                 if include_sources:
                                                     # Create a new column for Source
@@ -251,6 +260,21 @@ with tab1:
                                                 
                                                 # Display the transposed DataFrame
                                                 st.dataframe(detailed_df_transposed, use_container_width=True)
+                                                
+                                                # Render HTML tables for specific fields if they exist
+                                                for field in html_table_fields:
+                                                    row = detailed_df_transposed[detailed_df_transposed["Field"] == field]
+                                                    
+                                                    if not row.empty and isinstance(row["Value"].iloc[0], str) and "<table" in row["Value"].iloc[0]:
+                                                        table_html = row["Value"].iloc[0]
+                                                        
+                                                        if is_safe_table(table_html):  # Validate before rendering
+                                                            st.markdown(f"### Rendered {field.replace('_', ' ').title()}")
+                                                            cleaned_html = clean_html_table(table_html)
+                                                            st.markdown(cleaned_html, unsafe_allow_html=True)
+                                                            st.markdown("---")
+                                                        else:
+                                                            st.warning(f"Skipping {field} due to unsafe HTML content.")
                                             
                                             # Tab 2: Key-Value View
                                             with view_tabs[1]:
@@ -267,7 +291,16 @@ with tab1:
                                                     cols[0].markdown(f"**{field}:**")
                                                     
                                                     # Display value in second column
-                                                    cols[1].write(value)
+                                                    if field in html_table_fields and isinstance(value, str) and "<table" in value:
+                                                        # For HTML table fields, render the HTML if safe
+                                                        if is_safe_table(value):
+                                                            cleaned_html = clean_html_table(value)
+                                                            cols[1].markdown(cleaned_html, unsafe_allow_html=True)
+                                                        else:
+                                                            cols[1].warning("HTML content not displayed due to security concerns.")
+                                                    else:
+                                                        # For regular fields, use standard display
+                                                        cols[1].write(value)
                                                     
                                                     # Display source if include_sources is True
                                                     if include_sources:

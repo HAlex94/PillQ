@@ -7,6 +7,9 @@ import difflib
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse, parse_qs
 import os
+import json
+import urllib.error
+import bleach
 
 def get_openfda_searchable_fields():
     """
@@ -758,3 +761,71 @@ def search_name_placeholder(name_str, limit=50):
     # This is just a placeholder function to satisfy imports
     # Actual implementation should now use fetch_ndcs_for_name_drugsfda
     return []
+
+def clean_html_table(html_content):
+    """
+    Clean and sanitize HTML table for secure display in Streamlit.
+    
+    Args:
+        html_content (str): Raw HTML content containing a table
+        
+    Returns:
+        str: Cleaned and sanitized HTML
+    """
+    if not html_content or not isinstance(html_content, str):
+        return html_content
+    
+    # Define allowed HTML tags and attributes
+    allowed_tags = ["table", "tr", "td", "th", "thead", "tbody", "tfoot", "div", "span"]
+    allowed_attrs = {
+        "table": ["border", "class", "style", "width"],
+        "td": ["colspan", "rowspan", "style", "align"],
+        "th": ["colspan", "rowspan", "style", "align"],
+        "div": ["style", "class"],
+        "span": ["style", "class"]
+    }
+    
+    # Sanitize HTML content using bleach
+    sanitized_html = bleach.clean(
+        html_content, 
+        tags=allowed_tags, 
+        attributes=allowed_attrs, 
+        strip=True
+    )
+    
+    # Add a wrapper for scrolling on mobile
+    return f"""
+    <div style="overflow-x: auto; max-width: 100%;">
+        {sanitized_html}
+    </div>
+    """
+
+def is_safe_table(html_content):
+    """
+    Verify that the HTML content only contains safe table-related tags.
+    
+    Args:
+        html_content (str): HTML content to check
+        
+    Returns:
+        bool: True if the content only contains safe table elements
+    """
+    if not html_content or not isinstance(html_content, str):
+        return False
+    
+    try:
+        # Parse the HTML
+        soup = BeautifulSoup(html_content, "html.parser")
+        
+        # List of allowed HTML tags for tables
+        allowed_tags = {"table", "tr", "td", "th", "thead", "tbody", "tfoot", "div", "span"}
+        
+        # Check if all tags in the HTML are in the allowed list
+        for tag in soup.find_all():
+            if tag.name.lower() not in allowed_tags:
+                return False
+        
+        return True
+    except Exception as e:
+        print(f"Error checking HTML safety: {e}")
+        return False
