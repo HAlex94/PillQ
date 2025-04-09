@@ -176,6 +176,10 @@ with tab1:
                             df_display = pd.DataFrame(name_results)[["NDC", "brand_name", "generic_name", "strength", 
                                                                    "route", "dosage_form", "manufacturer", "package_description"]]
                             
+                            # Ensure all columns are string or compatible types for PyArrow
+                            for col in df_display.columns:
+                                df_display[col] = df_display[col].astype(str)
+                            
                             # Calculate dynamic height based on number of rows, capped at ~8 rows
                             num_rows = len(df_display)
                             # Base height per row (~40px) + header (~45px) + some padding
@@ -230,7 +234,7 @@ with tab1:
                                                 
                                                 # Handle list values to ensure proper display
                                                 detailed_df_transposed["Value"] = detailed_df_transposed["Value"].apply(
-                                                    lambda x: str(x) if isinstance(x, list) else x
+                                                    lambda x: json.dumps(x) if isinstance(x, list) else x
                                                 )
                                                 
                                                 # Create a copy of the data for display purposes
@@ -268,13 +272,29 @@ with tab1:
                                                     if not row.empty and isinstance(row["Value"].iloc[0], str) and "<table" in row["Value"].iloc[0]:
                                                         table_html = row["Value"].iloc[0]
                                                         
+                                                        st.markdown(f"### Rendered {field.replace('_', ' ').title()}")
                                                         if is_safe_table(table_html):  # Validate before rendering
-                                                            st.markdown(f"### Rendered {field.replace('_', ' ').title()}")
                                                             cleaned_html = clean_html_table(table_html)
                                                             st.markdown(cleaned_html, unsafe_allow_html=True)
-                                                            st.markdown("---")
                                                         else:
-                                                            st.warning(f"Skipping {field} due to unsafe HTML content.")
+                                                            st.warning(f"HTML content contains potentially unsafe elements and was not rendered.")
+                                                        st.markdown("---")
+                                                
+                                                # Also check regular fields for HTML tables 
+                                                regular_fields_with_tables = ["adverse_reactions", "clinical_studies", "instructions_for_use", "dosage_and_administration"]
+                                                for field in regular_fields_with_tables:
+                                                    row = detailed_df_transposed[detailed_df_transposed["Field"] == field]
+                                                    
+                                                    if not row.empty and isinstance(row["Value"].iloc[0], str) and "<table" in row["Value"].iloc[0]:
+                                                        table_html = row["Value"].iloc[0]
+                                                        
+                                                        st.markdown(f"### Rendered {field.replace('_', ' ').title()} Table")
+                                                        if is_safe_table(table_html):  # Validate before rendering
+                                                            cleaned_html = clean_html_table(table_html)
+                                                            st.markdown(cleaned_html, unsafe_allow_html=True)
+                                                        else:
+                                                            st.warning(f"HTML content contains potentially unsafe elements and was not rendered.")
+                                                        st.markdown("---")
                                             
                                             # Tab 2: Key-Value View
                                             with view_tabs[1]:
