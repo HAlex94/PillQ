@@ -10,6 +10,7 @@ import os
 import json
 import urllib.error
 import bleach
+import logging
 
 def get_openfda_searchable_fields():
     """
@@ -343,6 +344,7 @@ def fallback_ndc_search(drug_name, limit=10):
         r = requests.get(base_url, params=params, timeout=10)
         r.raise_for_status()
         jdata = r.json()
+        
         if "results" in jdata and jdata["results"]:
             for rec in jdata["results"]:
                 # 'product_ndc' is often the 10-digit code, e.g. "0077-3105"
@@ -613,33 +615,39 @@ def fetch_ndcs_for_name_drugsfda(name_str, limit=50):
 
 def search_ndc(ndc, labels_to_get, include_source=True):
     """
-    Search for NDC and return data for specified label fields.
+    Search for an NDC in both OpenFDA and DailyMed, focusing on the specific fields requested.
     
     Args:
         ndc (str): The NDC code to search for
-        labels_to_get (list): List of label fields to retrieve
-        include_source (bool): Whether to include the source of each field
+        labels_to_get (list): List of fields to include in the results
+        include_source (bool): Include the source of each field in the results
         
     Returns:
-        dict: Dictionary with the requested fields and their values
+        dict: Dictionary containing the results for the requested fields
     """
+    api_key_param = ""  # OpenFDA API key parameter, empty if no API key
     result = {}
     
-    # Get API key from environment variable if available
-    api_key = os.environ.get('OPENFDA_API_KEY', '')
-    api_key_param = f"&api_key={api_key}" if api_key else ""
-    
-    # Create a product-level NDC for OpenFDA queries
-    product_ndc = get_product_ndc(ndc)
-    
-    # Special handling for active_ingredient and inactive_ingredient using the old method
+    # Define separate lists for regular fields and fields that might contain HTML tables
+    regular_fields = []
+    table_fields = ["dosage_and_administration", "clinical_studies", "indications_and_usage", "warnings"]
     special_fields = ["active_ingredient", "inactive_ingredient", "indications_and_usage", "warnings", "description"]
-    regular_fields = [field for field in labels_to_get if field not in special_fields]
     
-    # Process special fields using the established methods
+    # Categorize requested fields
+    for field in labels_to_get:
+        if field in table_fields:
+            # Add _table suffix for clarity
+            table_field = f"{field}_table"
+            if table_field not in labels_to_get:
+                labels_to_get.append(table_field)
+        elif field not in special_fields:
+            regular_fields.append(field)
+            
+    # Process special fields first
     for field in special_fields:
         if field in labels_to_get:
             try:
+                print(f"Processing special field: {field}")
                 if field == "active_ingredient":
                     data, source = get_label_field(ndc, field, ["Active Ingredient", "Active Ingredients", "Ingredients"])
                 elif field == "inactive_ingredient":
@@ -660,58 +668,123 @@ def search_ndc(ndc, labels_to_get, include_source=True):
                 if include_source:
                     result[f"{field}_source"] = "Error"
     
-    # Process regular fields using the new method for efficiency
-    if regular_fields:
-        # Try OpenFDA first for the regular fields
-        openfda_url = f"https://api.fda.gov/drug/ndc.json?search=package_ndc:{ndc}{api_key_param}"
+    # Process table fields efficiently - look for HTML tables in relevant fields
+    try:
+        # Try OpenFDA first for table content
+        print("Checking OpenFDA for HTML tables")
+        openfda_label_url = f"https://api.fda.gov/drug/label.json?search=openfda.package_ndc:{ndc}{api_key_param}&limit=1"
+        response = requests.get(openfda_label_url)
         
-        try:
-            response = requests.get(openfda_url)
-            response.raise_for_status()
+        if response.status_code == 200:
             data = response.json()
-            
             if "results" in data and len(data["results"]) > 0:
                 product = data["results"][0]
                 
-                # Add all requested regular fields that are available in the OpenFDA response
-                for label in regular_fields:
-                    if label in product:
-                        result[label] = product[label]
-                        if include_source:
-                            result[f"{label}_source"] = "OpenFDA"
-                    elif label.startswith("openfda.") and "openfda" in product:
-                        # Handle nested openfda fields
-                        nested_field = label.split(".", 1)[1]
-                        if nested_field in product["openfda"]:
-                            result[label] = product["openfda"][nested_field]
+                # Check each table field
+                for field in table_fields:
+                    table_field = f"{field}_table"
+                    if table_field in labels_to_get and field in product:
+                        content = product[field]
+                        
+                        # Check if it's a list and has content
+                        if isinstance(content, list) and content:
+                            # Look for HTML tables in the content
+                            for item in content:
+                                if isinstance(item, str) and "<table" in item:
+                                    print(f"Found HTML table in OpenFDA field {field}")
+                                    result[table_field] = item
+                                    if include_source:
+                                        result[f"{table_field}_source"] = "OpenFDA"
+                                    break
+        
+        # If we didn't find tables in OpenFDA, try DailyMed
+        if not any(f"{field}_table" in result for field in table_fields):
+            print("Checking DailyMed for HTML tables")
+            setid = get_setid_from_search(ndc)
+            
+            if setid:
+                print(f"Found setid {setid} for NDC {ndc}")
+                # Fetch the HTML content
+                dailymed_url = f"https://dailymed.nlm.nih.gov/dailymed/drugInfo.cfm?setid={setid}"
+                response = requests.get(dailymed_url)
+                
+                if response.status_code == 200:
+                    soup = BeautifulSoup(response.text, 'html.parser')
+                    
+                    # Map fields to DailyMed section IDs
+                    field_to_section = {
+                        "dosage_and_administration_table": "dosage-administration",
+                        "clinical_studies_table": "clinical-studies",
+                        "indications_usage_table": "indications-usage",
+                        "warnings_table": "warnings"
+                    }
+                    
+                    # Check each section for tables
+                    for table_field, section_id in field_to_section.items():
+                        if table_field in labels_to_get:
+                            section = soup.find(id=section_id)
+                            if section:
+                                tables = section.find_all('table')
+                                if tables:
+                                    print(f"Found {len(tables)} tables in DailyMed section {section_id}")
+                                    result[table_field] = str(tables[0])
+                                    if include_source:
+                                        result[f"{table_field}_source"] = "DailyMed"
+    except Exception as e:
+        print(f"Error processing table fields: {e}")
+    
+    # Process regular fields
+    if regular_fields:
+        try:
+            # Try OpenFDA first
+            openfda_url = f"https://api.fda.gov/drug/ndc.json?search=package_ndc:{ndc}{api_key_param}"
+            response = requests.get(openfda_url)
+            
+            if response.status_code == 200:
+                data = response.json()
+                
+                if "results" in data and len(data["results"]) > 0:
+                    product = data["results"][0]
+                    
+                    # Add all requested regular fields
+                    for label in regular_fields:
+                        if label in product:
+                            result[label] = product[label]
                             if include_source:
                                 result[f"{label}_source"] = "OpenFDA"
+                        elif label.startswith("openfda.") and "openfda" in product:
+                            # Handle nested openfda fields
+                            nested_field = label.split(".", 1)[1]
+                            if nested_field in product["openfda"]:
+                                result[label] = product["openfda"][nested_field]
+                                if include_source:
+                                    result[f"{label}_source"] = "OpenFDA"
         except Exception as e:
             print(f"Error in OpenFDA lookup: {e}")
         
         # Try DailyMed for any missing regular fields
-        dailymed_url = f"https://dailymed.nlm.nih.gov/dailymed/services/v2/ndc/{ndc}.json"
-        
         try:
+            dailymed_url = f"https://dailymed.nlm.nih.gov/dailymed/services/v2/ndc/{ndc}.json"
             response = requests.get(dailymed_url)
-            response.raise_for_status()
-            dailymed_data = response.json()
             
-            # Process the DailyMed response to extract the requested fields
-            for label in regular_fields:
-                if label not in result and label in dailymed_data:
-                    result[label] = dailymed_data[label]
-                    if include_source:
-                        result[f"{label}_source"] = "DailyMed"
+            if response.status_code == 200:
+                dailymed_data = response.json()
+                
+                # Process the DailyMed response
+                for label in regular_fields:
+                    if label not in result and label in dailymed_data:
+                        result[label] = dailymed_data[label]
+                        if include_source:
+                            result[f"{label}_source"] = "DailyMed"
         except Exception as e:
             print(f"Error in DailyMed lookup: {e}")
     
-    # For any requested fields that were not found in either source
+    # For any requested fields that were not found
     for label in labels_to_get:
         if label not in result:
             result[label] = "Not available"
             if include_source:
-                result[f"{label}_source"] = "Error"
+                result[f"{label}_source"] = "Not found"
     
     return result
 
@@ -764,68 +837,144 @@ def search_name_placeholder(name_str, limit=50):
 
 def clean_html_table(html_content):
     """
-    Clean and sanitize HTML table for secure display in Streamlit.
+    Clean and prepare an HTML table for safe rendering in Streamlit.
     
     Args:
-        html_content (str): Raw HTML content containing a table
+        html_content (str): HTML table content
         
     Returns:
-        str: Cleaned and sanitized HTML
+        str: Cleaned and styled HTML ready for rendering
     """
     if not html_content or not isinstance(html_content, str):
-        return html_content
+        logging.warning("Empty or non-string HTML content passed to clean_html_table")
+        return ""
     
-    # Define allowed HTML tags and attributes
-    allowed_tags = ["table", "tr", "td", "th", "thead", "tbody", "tfoot", "div", "span"]
-    allowed_attrs = {
-        "table": ["border", "class", "style", "width"],
-        "td": ["colspan", "rowspan", "style", "align"],
-        "th": ["colspan", "rowspan", "style", "align"],
-        "div": ["style", "class"],
-        "span": ["style", "class"]
-    }
+    try:
+        # Use bleach to sanitize the HTML
+        allowed_tags = [
+            'table', 'thead', 'tbody', 'tfoot', 'tr', 'td', 'th', 
+            'caption', 'col', 'colgroup', 'div', 'span', 'p', 'br',
+            'ul', 'ol', 'li', 'b', 'i', 'strong', 'em', 'sup', 'sub'
+        ]
+        
+        allowed_attributes = {
+            'table': ['width', 'border', 'cellspacing', 'cellpadding', 'align', 'id', 'class'],
+            'th': ['scope', 'colspan', 'rowspan', 'width', 'align', 'valign'],
+            'td': ['colspan', 'rowspan', 'width', 'align', 'valign'],
+            'col': ['width', 'align', 'valign'],
+            'div': ['class', 'style'],
+            'span': ['class', 'style'],
+            'caption': ['align', 'class'],
+            '*': ['style', 'class'],
+        }
+        
+        # Sanitize the HTML
+        clean_html = bleach.clean(
+            html_content,
+            tags=allowed_tags,
+            attributes=allowed_attributes,
+            strip=True
+        )
+        
+        # Parse the cleaned HTML
+        soup = BeautifulSoup(clean_html, "html.parser")
+        
+        # Add responsive container for table scrolling
+        responsive_div = f'''
+        <div style="overflow-x: auto; max-width: 100%;">
+            {str(soup)}
+        </div>
+        '''
+        
+        return responsive_div
     
-    # Sanitize HTML content using bleach
-    sanitized_html = bleach.clean(
-        html_content, 
-        tags=allowed_tags, 
-        attributes=allowed_attrs, 
-        strip=True
-    )
-    
-    # Add a wrapper for scrolling on mobile
-    return f"""
-    <div style="overflow-x: auto; max-width: 100%;">
-        {sanitized_html}
-    </div>
-    """
+    except Exception as e:
+        logging.error(f"Error in clean_html_table: {e}")
+        return f"<p>Error processing HTML table: {str(e)}</p>"
 
 def is_safe_table(html_content):
     """
-    Verify that the HTML content only contains safe table-related tags.
+    Verify that the HTML content only contains safe elements for rendering.
+    Focuses on detecting dangerous content while being flexible with standard table elements.
     
     Args:
         html_content (str): HTML content to check
         
     Returns:
-        bool: True if the content only contains safe table elements
+        bool: True if the content is safe to render
     """
+    print(f"Checking HTML safety for content: {html_content[:50]}...")
+    
     if not html_content or not isinstance(html_content, str):
+        print("HTML content is empty or not a string")
+        return False
+    
+    # Basic check for table tag
+    if "<table" not in html_content:
+        print("No table tags found in HTML content")
         return False
     
     try:
-        # Parse the HTML
-        soup = BeautifulSoup(html_content, "html.parser")
+        # Check for dangerous JavaScript content
+        dangerous_patterns = [
+            "javascript:", "onerror=", "onclick=", "onload=", "onmouseover=", 
+            "eval(", "<script", "alert(", "document.cookie", "window.location"
+        ]
         
-        # List of allowed HTML tags for tables
-        allowed_tags = {"table", "tr", "td", "th", "thead", "tbody", "tfoot", "div", "span"}
-        
-        # Check if all tags in the HTML are in the allowed list
-        for tag in soup.find_all():
-            if tag.name.lower() not in allowed_tags:
+        for pattern in dangerous_patterns:
+            if pattern in html_content.lower():
+                print(f"Dangerous pattern found: {pattern}")
                 return False
         
+        # More sophisticated check using BeautifulSoup
+        soup = BeautifulSoup(html_content, "html.parser")
+        
+        # List of potentially dangerous tags
+        dangerous_tags = {
+            "script", "iframe", "object", "embed", "form", "input", "button", 
+            "applet", "meta", "link", "base", "frame", "frameset"
+        }
+        
+        # Check for dangerous tags
+        for tag in soup.find_all():
+            if tag.name.lower() in dangerous_tags:
+                print(f"Dangerous tag found: {tag.name}")
+                return False
+        
+        # Check for suspicious attributes 
+        suspicious_attrs = ["onclick", "onload", "onerror", "onmouseover", "javascript", "eval"]
+        for tag in soup.find_all():
+            for attr, value in tag.attrs.items():
+                attr_value = str(value).lower()
+                if any(susp in attr.lower() or susp in attr_value for susp in suspicious_attrs):
+                    print(f"Suspicious attribute detected: {attr}={value}")
+                    return False
+        
+        print("HTML content passed safety check")
         return True
     except Exception as e:
         print(f"Error checking HTML safety: {e}")
         return False
+
+def prepare_df_for_streamlit(df):
+    """
+    Prepare a DataFrame for display in Streamlit by ensuring all columns
+    have PyArrow-compatible data types
+    
+    Args:
+        df (pandas.DataFrame): DataFrame to prepare
+        
+    Returns:
+        pandas.DataFrame: DataFrame with PyArrow-compatible data types
+    """
+    # Create a copy to avoid modifying the original
+    df = df.copy()
+    
+    # Convert all columns to strings
+    for col in df.columns:
+        df[col] = df[col].astype(str)
+        
+    # Replace 'None' and 'nan' strings with empty strings
+    df = df.replace({'None': '', 'nan': '', 'NaN': ''})
+    
+    return df

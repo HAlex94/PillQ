@@ -22,7 +22,8 @@ from helper_functions import (
     get_single_item_source,
     convert_df,
     clean_html_table,
-    is_safe_table
+    is_safe_table,
+    prepare_df_for_streamlit
 )
 
 # ------------------------------------------------------------------
@@ -176,9 +177,8 @@ with tab1:
                             df_display = pd.DataFrame(name_results)[["NDC", "brand_name", "generic_name", "strength", 
                                                                    "route", "dosage_form", "manufacturer", "package_description"]]
                             
-                            # Ensure all columns are string or compatible types for PyArrow
-                            for col in df_display.columns:
-                                df_display[col] = df_display[col].astype(str)
+                            # Prepare DataFrame for Streamlit display
+                            df_display = prepare_df_for_streamlit(df_display)
                             
                             # Calculate dynamic height based on number of rows, capped at ~8 rows
                             num_rows = len(df_display)
@@ -232,13 +232,11 @@ with tab1:
                                                 detailed_df_transposed = detailed_df.T.reset_index()
                                                 detailed_df_transposed.columns = ["Field", "Value"]
                                                 
-                                                # Handle list values to ensure proper display
-                                                detailed_df_transposed["Value"] = detailed_df_transposed["Value"].apply(
-                                                    lambda x: json.dumps(x) if isinstance(x, list) else x
-                                                )
+                                                # Prepare for Streamlit display
+                                                detailed_df_transposed = prepare_df_for_streamlit(detailed_df_transposed)
                                                 
-                                                # Create a copy of the data for display purposes
-                                                display_df = detailed_df_transposed.copy()
+                                                # Display the DataFrame
+                                                st.dataframe(detailed_df_transposed, use_container_width=True)
                                                 
                                                 # Check for HTML table fields that should be rendered
                                                 html_table_fields = ["dosage_and_administration_table", "clinical_studies_table", 
@@ -261,9 +259,6 @@ with tab1:
                                                     
                                                     # Filter out _source fields
                                                     detailed_df_transposed = detailed_df_transposed[~detailed_df_transposed["Field"].str.endswith("_source")]
-                                                
-                                                # Display the transposed DataFrame
-                                                st.dataframe(detailed_df_transposed, use_container_width=True)
                                                 
                                                 # Render HTML tables for specific fields if they exist
                                                 for field in html_table_fields:
@@ -490,22 +485,22 @@ with tab1:
                     if export_format == "JSON":
                         st.json(all_results[0])
                     elif export_format == "CSV":
-                        st.dataframe(pd.DataFrame([all_results[0]]))
+                        st.dataframe(prepare_df_for_streamlit(pd.DataFrame([all_results[0]])))
                     elif export_format == "Excel":
-                        st.dataframe(pd.DataFrame([all_results[0]]))
+                        st.dataframe(prepare_df_for_streamlit(pd.DataFrame([all_results[0]])))
                     elif export_format == "TXT":
-                        st.text(pd.DataFrame([all_results[0]]).to_csv(sep="\t", index=False))
+                        st.text(prepare_df_for_streamlit(pd.DataFrame([all_results[0]])).to_csv(sep="\t", index=False))
                 else:
                     df = pd.DataFrame(all_results)
                     
                     if 'ndc' in df.columns:
                         df = df.rename(columns={'ndc': 'NDC'})
                         
-                    st.dataframe(df)
+                    st.dataframe(prepare_df_for_streamlit(df))
                 
                 st.download_button(
                     label=f"Download as {export_format}",
-                    data=convert_df(pd.DataFrame(all_results), export_format),
+                    data=convert_df(prepare_df_for_streamlit(pd.DataFrame(all_results)), export_format),
                     file_name=f"pillq_export.{export_format.lower()}",
                     mime="text/csv" if export_format == "CSV" else "application/octet-stream"
                 )
@@ -1059,7 +1054,7 @@ with tab2:
                 st.stop()
             
             st.subheader("File Preview")
-            st.dataframe(df.head(5))
+            st.dataframe(prepare_df_for_streamlit(df.head(5)))
             
             # Move export format selection before Configure Processing
             export_format = st.radio(
@@ -1132,11 +1127,11 @@ with tab2:
                             result_df[col] = openfda_df[col].values
                 
                 st.subheader("Results")
-                st.dataframe(result_df)
+                st.dataframe(prepare_df_for_streamlit(result_df))
                 
                 st.download_button(
                     label=f"Download Results as {export_format}",
-                    data=convert_df(result_df, export_format),
+                    data=convert_df(prepare_df_for_streamlit(result_df), export_format),
                     file_name=f"pillq_enriched_data.{export_format.lower()}",
                     mime="text/csv" if export_format == "CSV" else "application/octet-stream"
                 )
