@@ -22,9 +22,10 @@ from helper_functions import (
     get_single_item_source,
     convert_df,
     clean_html_table,
-    is_safe_table,
-    prepare_df_for_streamlit
+    is_safe_table
 )
+
+from streamlit_helpers import prepare_df_for_streamlit
 
 # ------------------------------------------------------------------
 # Initialize session state
